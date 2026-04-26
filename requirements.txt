@@ -1,0 +1,16 @@
+flask>=3.0.0
+scapy
+web3>=6.0.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+paho-mqtt>=2.0.0
+pandas
+numpy>=1.26.0
+scikit-learn>=1.4.0
+tensorflow>=2.15.0
+matplotlib
+Pillow>=10.0.0
+mitmproxy
+Adafruit-DHT>=1.4.0
+opencv-python-headless>=4.9.0
+RPi.GPIO>=0.7.1
