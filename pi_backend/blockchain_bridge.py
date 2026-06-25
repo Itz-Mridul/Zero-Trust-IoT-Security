@@ -1,139 +1,347 @@
 #!/usr/bin/env python3
 """
-Blockchain Bridge — logs every security event to Ganache
+Blockchain Bridge — REST API + MQTT Bridge for Ganache
+=======================================================
+Provides:
+  - POST /check_rfid   → Verify RFID UID against blockchain registry
+  - POST /register_rfid → Register new RFID UID on blockchain
+  - MQTT listener on 'blockchain/log' → Logs events to chain
+  - Publishes TX hashes to 'blockchain/tx' for dashboard display
+
+Runs on port 5010.
+
+Usage:
+    python3 pi_backend/blockchain_bridge.py
 """
-import os
+
 import json
-import time
 import logging
+import os
+import sys
 import threading
-from flask import Flask, request, jsonify
-from web3 import Web3
-import paho.mqtt.client as mqtt
+import time
+
+# Add project root to path so we can import from pi_backend directly
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [BLOCKCHAIN] %(levelname)s: %(message)s",
+)
 log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-BLOCKCHAIN_URL   = os.getenv("BLOCKCHAIN_URL",   "http://127.0.0.1:7545")
-CONTRACT_ADDRESS = os.getenv("CONTRACT_ADDRESS", "")
-MQTT_BROKER      = os.getenv("MQTT_BROKER",      "localhost")
+BLOCKCHAIN_URL = os.environ.get("BLOCKCHAIN_URL", "http://127.0.0.1:7545")
+CONTRACT_ADDRESS = os.environ.get("CONTRACT_ADDRESS", "")
+MQTT_BROKER = os.environ.get("MQTT_BROKER", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
+BRIDGE_PORT = int(os.environ.get("BLOCKCHAIN_BRIDGE_PORT", "5010"))
 
-w3 = Web3(Web3.HTTPProvider(BLOCKCHAIN_URL))
-if not w3.is_connected():
-    log.warning(f"⚠️  Cannot connect to blockchain at {BLOCKCHAIN_URL}. Running without blockchain.")
+# ── Web3 setup ─────────────────────────────────────────────────────────────────
+
+_w3 = None
+_contract = None
+_deployer = None
+_mqtt_pub = None
 
 
-# Minimal ABI for SecurityRegistry
-ABI = [
-    {"inputs":[
-        {"name":"deviceId","type":"string"},
-        {"name":"eventType","type":"string"},
-        {"name":"dataHash","type":"string"},
-        {"name":"timestamp","type":"uint256"}
-     ],"name":"logEvent","outputs":[{"type":"uint256"}],"stateMutability":"nonpayable","type":"function"},
-    {"inputs":[{"name":"uid","type":"string"}],"name":"isRfidRegistered",
-     "outputs":[{"type":"bool"}],"stateMutability":"view","type":"function"},
-    {"inputs":[{"name":"uid","type":"string"},{"name":"owner","type":"string"}],
-     "name":"registerRfid","outputs":[],"stateMutability":"nonpayable","type":"function"},
-]
+def _init_web3():
+    """Initialize Web3 connection and contract. Fails gracefully."""
+    global _w3, _contract, _deployer
 
-try:
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(CONTRACT_ADDRESS) if CONTRACT_ADDRESS else Web3.to_checksum_address("0x0000000000000000000000000000000000000000"),
-        abi=ABI
-    )
-    deployer = w3.eth.accounts[0] if w3.eth.accounts else None
-except Exception as e:
-    log.error(f"Blockchain setup failed: {e}")
-    deployer = None
-    contract = None
+    try:
+        from web3 import Web3
+    except ImportError:
+        log.error("web3 not installed: pip install web3")
+        return False
 
-app = Flask(__name__)
+    _w3 = Web3(Web3.HTTPProvider(BLOCKCHAIN_URL))
+
+    if not _w3.is_connected():
+        log.error(f"Cannot connect to blockchain at {BLOCKCHAIN_URL}")
+        return False
+
+    if not CONTRACT_ADDRESS:
+        log.warning(
+            "CONTRACT_ADDRESS not set — blockchain logging disabled. "
+            "Deploy contract first and set CONTRACT_ADDRESS in .env"
+        )
+        return False
+
+    # ABI for SecurityRegistry (logEvent, registerRfid, isRfidRegistered)
+    abi = [
+        {
+            "inputs": [
+                {"name": "deviceId", "type": "string"},
+                {"name": "eventType", "type": "string"},
+                {"name": "dataHash", "type": "string"},
+                {"name": "timestamp", "type": "uint256"},
+            ],
+            "name": "logEvent",
+            "outputs": [{"type": "uint256"}],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [{"name": "uid", "type": "string"}],
+            "name": "isRfidRegistered",
+            "outputs": [{"type": "bool"}],
+            "stateMutability": "view",
+            "type": "function",
+        },
+        {
+            "inputs": [
+                {"name": "uid", "type": "string"},
+                {"name": "owner", "type": "string"},
+            ],
+            "name": "registerRfid",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+        {
+            "inputs": [{"name": "uid", "type": "string"}],
+            "name": "emergencyRevoke",
+            "outputs": [],
+            "stateMutability": "nonpayable",
+            "type": "function",
+        },
+    ]
+
+    try:
+        from web3 import Web3 as W3
+        _contract = _w3.eth.contract(
+            address=W3.to_checksum_address(CONTRACT_ADDRESS),
+            abi=abi,
+        )
+        _deployer = _w3.eth.accounts[0]
+        log.info(
+            f"✅ Blockchain connected: {BLOCKCHAIN_URL} | "
+            f"Contract: {CONTRACT_ADDRESS[:16]}..."
+        )
+        return True
+    except Exception as exc:
+        log.error(f"Contract load failed: {exc}")
+        return False
+
+
+# ── Public helpers (imported by forensic_logger, gateway_logic, tests) ─────────
+
+import hashlib as _hashlib
+
+
+def hash_event(event_data: str) -> str:
+    """Return SHA-256 hex digest of an event string."""
+    return _hashlib.sha256(event_data.encode("utf-8")).hexdigest()
+
+
+def register_event_on_chain(device_name: str, fingerprint_score: int):
+    """
+    Compatibility wrapper used by forensic_logger.py and gateway_logic.
+    Maps old registerDevice() interface to new logEvent() interface.
+    Returns receipt-like object with .transactionHash, or None on failure.
+    """
+    data_hash = hash_event(f"{device_name}:{fingerprint_score}")
+    tx = log_to_chain(device_name, "SECURITY_EVENT", data_hash)
+    if tx:
+        # Return a minimal receipt-like object so callers can do receipt.transactionHash.hex()
+        class _Receipt:
+            class transactionHash:
+                @staticmethod
+                def hex():
+                    return tx
+        return _Receipt()
+    return None
+
+
+# ── Blockchain functions ───────────────────────────────────────────────────────
+
 
 def log_to_chain(device_id: str, event_type: str, data_hash: str) -> str:
-    if not contract or not deployer:
+    """Log a security event to the blockchain. Returns TX hash or empty string."""
+    if _contract is None or _deployer is None:
         return ""
+
     try:
-        tx = contract.functions.logEvent(
+        tx = _contract.functions.logEvent(
             device_id, event_type, data_hash, int(time.time())
-        ).transact({"from": deployer, "gas": 200000})
-        receipt = w3.eth.wait_for_transaction_receipt(tx)
+        ).transact({"from": _deployer, "gas": 200000})
+        receipt = _w3.eth.wait_for_transaction_receipt(tx, timeout=10)
         tx_hash = receipt.transactionHash.hex()
         log.info(f"⛓️ Logged to blockchain: {tx_hash[:16]}...")
         return tx_hash
-    except Exception as e:
-        log.error(f"Blockchain log failed: {e}")
+    except Exception as exc:
+        log.error(f"Blockchain log failed: {exc}")
         return ""
 
-@app.route("/check_rfid", methods=["POST"])
-def check_rfid():
-    uid = request.json.get("uid", "")
-    secret_code = request.json.get("secret_code", "")
-    
-    # Duress Check
-    if secret_code == "9999" or uid == "9999":
-        log.warning(f"🚨 DURESS CODE DETECTED for UID {uid}")
-        log_to_chain("SYSTEM", "DURESS_ALERT", f"uid={uid}")
-        # In a real system, you might trigger a silent alarm here
-        return jsonify({"registered": False, "duress": True})
 
+def check_rfid_on_chain(uid: str) -> bool:
+    """Check if an RFID UID is registered on the blockchain."""
+    if _contract is None:
+        return False
     try:
-        registered = contract.functions.isRfidRegistered(uid).call()
-        return jsonify({"registered": registered, "duress": False})
-    except Exception as e:
-        log.error(f"Check RFID failed: {e}")
-        return jsonify({"registered": False, "error": str(e), "duress": False})
+        return _contract.functions.isRfidRegistered(uid).call()
+    except Exception:
+        return False
 
-@app.route("/register_rfid", methods=["POST"])
-def register_rfid():
-    uid   = request.json.get("uid", "")
-    owner = request.json.get("owner", "ADMIN")
-    if not contract or not deployer:
-        return jsonify({"success": False, "error": "Blockchain not connected"})
+
+def register_rfid_on_chain(uid: str, owner: str) -> bool:
+    """Register an RFID UID on the blockchain."""
+    if _contract is None or _deployer is None:
+        return False
     try:
-        contract.functions.registerRfid(uid, owner).transact({"from": deployer})
-        return jsonify({"success": True})
-    except Exception as e:
-        log.error(f"Register RFID failed: {e}")
-        return jsonify({"success": False, "error": str(e)})
+        _contract.functions.registerRfid(uid, owner).transact(
+            {"from": _deployer}
+        )
+        log.info(f"✅ RFID registered: {uid} → {owner}")
+        return True
+    except Exception as exc:
+        log.error(f"RFID registration failed: {exc}")
+        return False
 
-# MQTT listener for blockchain/log topic
-def mqtt_logger():
+
+def revoke_rfid_on_chain(uid: str) -> bool:
+    """Emergency revoke an RFID UID on the blockchain."""
+    if _contract is None or _deployer is None:
+        return False
+    try:
+        _contract.functions.emergencyRevoke(uid).transact(
+            {"from": _deployer}
+        )
+        log.info(f"🚨 RFID revoked: {uid}")
+        return True
+    except Exception as exc:
+        log.error(f"RFID revoke failed: {exc}")
+        return False
+
+
+# ── MQTT listener ──────────────────────────────────────────────────────────────
+
+
+def _mqtt_logger_loop():
+    """Background MQTT listener that logs events to blockchain."""
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        log.warning("paho-mqtt not installed — MQTT→blockchain disabled")
+        return
+
     def on_msg(client, userdata, msg):
         try:
-            d  = json.loads(msg.payload.decode())
+            d = json.loads(msg.payload.decode())
             tx = log_to_chain(
-                d.get("device","UNKNOWN"),
-                d.get("event","EVENT"),
-                d.get("hash","")
+                d.get("device", d.get("device_id", "UNKNOWN")),
+                d.get("event", d.get("event_type", "EVENT")),
+                d.get("hash", d.get("data_hash", "")),
             )
-            if tx:
-                mqtt_pub.publish("blockchain/tx", json.dumps({"tx_hash": tx}))
-        except Exception as e: 
-            log.error(f"MQTT Error: {e}")
+            if tx and _mqtt_pub:
+                _mqtt_pub.publish(
+                    "blockchain/tx",
+                    json.dumps({"tx_hash": tx}),
+                )
+        except Exception as exc:
+            log.error(f"MQTT→blockchain error: {exc}")
 
-    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+    c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="BC_LOGGER")
     c.on_message = on_msg
-    
-    while True:
-        try:
-            c.connect(MQTT_BROKER, 1883, 60)
-            c.subscribe("blockchain/log")
-            log.info("⛓️ Connected to MQTT for blockchain logging")
-            c.loop_forever()
-        except Exception as e:
-            log.error(f"MQTT connection failed: {e}. Retrying in 5s...")
-            time.sleep(5)
+    try:
+        c.connect(MQTT_BROKER, MQTT_PORT, 60)
+        c.subscribe("blockchain/log")
+        c.loop_forever()
+    except Exception as exc:
+        log.error(f"MQTT logger connection failed: {exc}")
 
-mqtt_pub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-try:
-    mqtt_pub.connect(MQTT_BROKER, 1883, 60)
-except:
-    pass
+
+# ── Flask REST API ─────────────────────────────────────────────────────────────
+
+
+def create_app():
+    """Create the Flask app with blockchain endpoints."""
+    from flask import Flask, request, jsonify
+
+    app = Flask(__name__)
+
+    @app.route("/check_rfid", methods=["POST"])
+    def check_rfid():
+        """Check if an RFID UID is registered on the blockchain."""
+        data = request.get_json(silent=True) or {}
+        uid = data.get("uid", "")
+        if not uid:
+            return jsonify({"registered": False, "error": "Missing uid"}), 400
+        registered = check_rfid_on_chain(uid)
+        return jsonify({"registered": registered, "uid": uid})
+
+    @app.route("/register_rfid", methods=["POST"])
+    def register_rfid():
+        """Register a new RFID UID on the blockchain."""
+        data = request.get_json(silent=True) or {}
+        uid = data.get("uid", "")
+        owner = data.get("owner", "ADMIN")
+        if not uid:
+            return jsonify({"success": False, "error": "Missing uid"}), 400
+        success = register_rfid_on_chain(uid, owner)
+        return jsonify({"success": success, "uid": uid, "owner": owner})
+
+    @app.route("/revoke_rfid", methods=["POST"])
+    def revoke_rfid():
+        """Emergency revoke an RFID UID."""
+        data = request.get_json(silent=True) or {}
+        uid = data.get("uid", "")
+        if not uid:
+            return jsonify({"success": False, "error": "Missing uid"}), 400
+        success = revoke_rfid_on_chain(uid)
+        return jsonify({"success": success, "uid": uid})
+
+    @app.route("/log_event", methods=["POST"])
+    def log_event():
+        """Manually log an event to the blockchain."""
+        data = request.get_json(silent=True) or {}
+        device = data.get("device_id", "MANUAL")
+        event_type = data.get("event_type", "MANUAL_LOG")
+        data_hash = data.get("data_hash", "")
+        tx = log_to_chain(device, event_type, data_hash)
+        return jsonify({"tx_hash": tx, "success": bool(tx)})
+
+    @app.route("/health", methods=["GET"])
+    def health():
+        """Health check for the blockchain bridge."""
+        connected = _w3 is not None and _w3.is_connected()
+        return jsonify({
+            "blockchain_connected": connected,
+            "blockchain_url": BLOCKCHAIN_URL,
+            "contract_address": CONTRACT_ADDRESS or "NOT_SET",
+            "mqtt_broker": MQTT_BROKER,
+        })
+
+    return app
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
-    threading.Thread(target=mqtt_logger, daemon=True).start()
-    print("⛓️  Blockchain bridge: http://0.0.0.0:5010")
-    app.run(host="0.0.0.0", port=5010, debug=False)
+    import paho.mqtt.client as mqtt
+
+    _init_web3()
+
+    # Start MQTT publisher client
+    _mqtt_pub = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="BC_PUB")
+    try:
+        _mqtt_pub.connect(MQTT_BROKER, MQTT_PORT, 60)
+        _mqtt_pub.loop_start()
+    except Exception as exc:
+        log.warning(f"MQTT publisher failed: {exc}")
+        _mqtt_pub = None
+
+    # Start MQTT→blockchain logger in background
+    threading.Thread(target=_mqtt_logger_loop, daemon=True).start()
+
+    # Start Flask REST API
+    app = create_app()
+    print(f"\n⛓️  Blockchain Bridge: http://0.0.0.0:{BRIDGE_PORT}")
+    print(f"   Endpoints: /check_rfid, /register_rfid, /revoke_rfid, /log_event")
+    print(f"   Health:    /health\n")
+    app.run(host="0.0.0.0", port=BRIDGE_PORT, debug=False)

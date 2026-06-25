@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-CNN-LSTM Hardware Fingerprint Trainer
-Trains the device authentication model on merged legitimate + attack data.
+CNN-LSTM Hardware Fingerprint Trainer — Dual-Backend
+=====================================================
+Research Paper Reference: Phase 4, Section 4.2
 
-Expected DB: ml_models/training_data.db
-Output:
-  ml_models/device_authenticator.h5   (Keras model)
-  ml_models/scaler.pkl                 (StandardScaler)
+Primary  : TensorFlow CNN-LSTM   → ml_models/device_authenticator.h5
+Fallback : sklearn RandomForest  → ml_models/device_authenticator.pkl
+
+Usage:
+  # Normal (requires real collected data):
+  python3 ml_models/train_model.py
+
+  # Synthetic only (no hardware required — CI / first-time setup):
+  SYNTHETIC_ONLY=true python3 ml_models/train_model.py
+
+Outputs:
+  ml_models/device_authenticator.h5  (Keras CNN-LSTM — if TF available)
+  ml_models/device_authenticator.pkl (sklearn RF — always produced)
+  ml_models/scaler.pkl               (StandardScaler)
 """
 import os
 import sys
@@ -15,6 +26,7 @@ import sqlite3
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -33,19 +45,54 @@ MIN_PER_CLASS       = 50
 FEATS = ["rssi", "packet_size", "free_heap",
          "inter_packet_delay", "temperature", "humidity"]
 
-# ── Load ──────────────────────────────────────────────────────────────
-if not os.path.exists(DB_PATH):
-    print(f"\n❌ Training DB not found: {DB_PATH}")
-    print("   Run the merge step first (see FINAL_COMPLETION_GUIDE.md Part 2 Step 3)")
-    sys.exit(1)
+SYNTHETIC_ONLY = os.environ.get("SYNTHETIC_ONLY", "false").lower() in ("1", "true", "yes")
+PKL_PATH    = os.path.join(BASE_DIR, "device_authenticator.pkl")
 
-print(f"\n📊 Loading data from: {DB_PATH}")
-conn = sqlite3.connect(DB_PATH)
-df   = pd.read_sql(
-    "SELECT * FROM heartbeats WHERE inter_packet_delay > 0 ORDER BY device_id, received_at",
-    conn,
-)
-conn.close()
+# ── Synthetic data generator ───────────────────────────────────────────
+def _generate_synthetic(n_per_class: int = 300) -> tuple:
+    """Generate synthetic legitimate + spoof heartbeat sequences."""
+    rng = np.random.default_rng(42)
+    legit = np.column_stack([
+        rng.normal(-65, 5,     n_per_class),
+        rng.normal(120, 8,     n_per_class),
+        rng.normal(180000, 10000, n_per_class),
+        rng.normal(500, 40,    n_per_class),   # natural clock drift
+        rng.normal(23, 2,      n_per_class),
+        rng.normal(55, 5,      n_per_class),
+    ])
+    spoof = np.column_stack([
+        rng.normal(-72, 12,    n_per_class),
+        rng.normal(115, 20,    n_per_class),
+        rng.normal(210000, 30000, n_per_class),
+        rng.normal(200, 5,     n_per_class),   # too-perfect (no jitter)
+        rng.normal(25, 0.1,    n_per_class),   # temperature too stable
+        rng.normal(50, 0.5,    n_per_class),
+    ])
+    X = np.vstack([legit, spoof])
+    y = np.array([1] * n_per_class + [0] * n_per_class)
+    return X, y
+
+# ── Load or generate data ──────────────────────────────────────────────
+if SYNTHETIC_ONLY:
+    print("\n⚙️  SYNTHETIC_ONLY mode — generating training data (no ESP32 required)")
+    X_raw, y_raw = _generate_synthetic(n_per_class=300)
+    df = pd.DataFrame(X_raw, columns=FEATS)
+    df["is_legitimate"] = y_raw
+    df["device_id"] = ["synthetic_legit" if l == 1 else "synthetic_spoof" for l in y_raw]
+    df["received_at"] = list(range(len(y_raw)))
+elif not os.path.exists(DB_PATH):
+    print(f"\n❌ Training DB not found: {DB_PATH}")
+    print("   Run:  SYNTHETIC_ONLY=true python3 ml_models/train_model.py")
+    print("   Or collect real data first (see research.md Section 4.2)")
+    sys.exit(1)
+else:
+    print(f"\n📊 Loading data from: {DB_PATH}")
+    conn = sqlite3.connect(DB_PATH)
+    df   = pd.read_sql(
+        "SELECT * FROM heartbeats WHERE inter_packet_delay > 0 ORDER BY device_id, received_at",
+        conn,
+    )
+    conn.close()
 
 print(f"✅ Loaded {len(df)} total samples")
 print("\n📊 Class distribution:")
@@ -96,8 +143,23 @@ try:
     from tensorflow import keras
     from tensorflow.keras import layers
 except ImportError:
-    print("❌ TensorFlow not installed — run: pip install tensorflow>=2.15.0")
-    sys.exit(1)
+    print("\nℹ️  TensorFlow not available — training sklearn RandomForest fallback only.")
+    # ── sklearn RandomForest (fallback path) ──────────────────────────────
+    print("\n🌲 Training sklearn RandomForest fallback model…")
+    X_flat = X_tr.reshape(len(X_tr), -1)
+    X_te_flat = X_te.reshape(len(X_te), -1)
+    clf = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+    clf.fit(scaler.fit_transform(X_flat), y_tr)
+    acc = clf.score(scaler.transform(X_te_flat), y_te)
+    print(f"  RandomForest accuracy: {acc*100:.2f}%")
+    with open(PKL_PATH, "wb") as f:
+        pickle.dump(clf, f)
+    print(f"\n✅ sklearn model saved: {PKL_PATH}")
+    # Re-save scaler fitted on flat data
+    with open(SCALER_PATH, "wb") as f:
+        pickle.dump(scaler, f)
+    print(f"✅ Scaler saved       : {SCALER_PATH}")
+    sys.exit(0)
 
 print(f"\n🏗️  Building CNN-LSTM (input shape: {SEQ_LENGTH} × {len(FEATS)})…")
 model = keras.Sequential([

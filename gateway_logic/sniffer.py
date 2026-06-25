@@ -20,10 +20,10 @@ from scapy.all import DNSQR, IP, sniff
 # ---------------------------------------------------------------------------
 import os
 # IPs that are always allowed (gateway, Pi, router, Google DNS)
-_PI_IP = os.environ.get("GATEWAY_IP", "192.168.1.113")
+_PI_IP = os.environ.get("PI_LOCAL_IP", os.environ.get("GATEWAY_IP", "10.238.130.161"))
 TRUSTED_IPS = {
     _PI_IP,
-    "192.168.1.1",
+    os.environ.get("MOBILE_IP", "10.238.130.38"),   # Mobile hotspot gateway/router
     "8.8.8.8",
     "8.8.4.4",
     "127.0.0.1",

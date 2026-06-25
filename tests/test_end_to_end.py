@@ -8,6 +8,7 @@ import sys
 import json
 import sqlite3
 import time
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pi_backend"))
@@ -65,25 +66,24 @@ def test_forensic_logger():
 
 def test_safe_eval():
     """Test that iot_server's _safe_eval blocks dangerous expressions."""
-    from pi_backend.iot_server import _safe_eval
+    try:
+        from pi_backend.iot_server import _safe_eval
+    except ImportError as e:
+        pytest.skip(f"iot_server import failed (missing optional dep): {e}")
 
-    # Valid expressions
     assert _safe_eval("3 + 5") == 8
     assert _safe_eval("7 * 3") == 21
     assert _safe_eval("10 - 4") == 6
     print("✅ _safe_eval handles valid expressions")
 
-    # Dangerous expressions should raise ValueError
     dangerous = ["__import__('os')", "open('/etc/passwd')", "eval('1+1')"]
     for expr in dangerous:
         try:
             _safe_eval(expr)
-            print(f"❌ _safe_eval should have rejected: {expr}")
-            return False
+            assert False, f"_safe_eval should have rejected: {expr}"
         except (ValueError, SyntaxError):
-            pass  # expected
+            pass
     print("✅ _safe_eval blocks dangerous expressions")
-    return True
 
 
 def test_blockchain_bridge_import():

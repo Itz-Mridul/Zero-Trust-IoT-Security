@@ -1,486 +1,1076 @@
 #!/usr/bin/env python3
 """
-Zero-Trust IoT Security - Single Pane of Glass Dashboard
-Flask app running on port 5001
-Real-time trust scores, event feed, blockchain forensics, threat metrics
-Auto-refreshes every 3 seconds
+Zero-Trust IoT Security Dashboard
+===================================
+"Single Pane of Glass" — Flask web app that displays:
+  • Live trust score gauges for every ESP32 node
+  • Real-time attack event feed
+  • Blockchain / forensic evidence log
+  • Thermal alerts panel
+  • Live MJPEG stream placeholder
+
+Run:
+    python3 pi_backend/dashboard.py
+
+Then open http://localhost:5001 in your browser.
 """
 
-import sqlite3
 import json
 import os
+import sqlite3
+import sys
 import time
-from flask import Flask, jsonify, render_template_string
-from collections import deque
+from pathlib import Path
+
+# Add project root to path so we can import from pi_backend directly
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+try:
+    from flask import Flask, Response, jsonify, render_template_string, stream_with_context
+except ImportError:
+    raise SystemExit("Flask is required: pip install flask")
+
+from pi_backend.forensic_logger import get_recent_access_log
+from pi_backend.photo_store import load_device_photo
+from pi_backend.photo_store import store_device_photo as persist_device_photo
+from pi_backend.thermal_monitor import get_thermal_alerts
+
+# Photo storage: latest JPEG per device (populated by MQTT photo handler)
+_latest_photos: dict = {}   # {device_id: bytes}
+
+def store_device_photo(device_id: str, jpeg_bytes: bytes) -> None:
+    """Called by the MQTT handler when a photo payload arrives."""
+    _latest_photos[device_id] = jpeg_bytes
+    persist_device_photo(device_id, jpeg_bytes)
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("IOT_DB_PATH", os.path.join(_BASE_DIR, "security.db"))
 
 app = Flask(__name__)
 
-DB_PATH = '/home/mridul/Master_IoT_Project/security.db'
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML Template — Dark Mode Single-Page Dashboard
+# ─────────────────────────────────────────────────────────────────────────────
 
-# In-memory event store (acts as live feed buffer)
-live_events = deque(maxlen=50)
-trust_scores = {}  # {device_id: {"score": float, "status": str, "last_seen": float}}
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def get_stats():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM heartbeats")
-        total_traffic = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM alerts WHERE event_type='TAMPER'")
-        tamper_alerts = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM alerts WHERE event_type='REJECTED'")
-        events_blocked = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(DISTINCT device_id) FROM heartbeats")
-        devices = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM alerts WHERE event_type='THERMAL'")
-        thermal_alerts = cur.fetchone()[0]
-        conn.close()
-        return {
-            "total_traffic": total_traffic,
-            "tamper_alerts": tamper_alerts,
-            "events_blocked": events_blocked,
-            "active_devices": devices,
-            "thermal_alerts": thermal_alerts
-        }
-    except Exception as e:
-        return {"total_traffic": 0, "tamper_alerts": 0, "events_blocked": 0, "active_devices": 0, "thermal_alerts": 0}
-
-def get_recent_events():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT device_id, event_type, timestamp, details
-            FROM alerts ORDER BY id DESC LIMIT 20
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"[dashboard] get_recent_events error: {e}")
-        return []
-
-def get_forensic_log():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id, device_id, image_hash, timestamp, blockchain_tx, verified
-            FROM evidence ORDER BY id DESC LIMIT 10
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    except Exception as e:
-        print(f"[dashboard] get_forensic_log error: {e}")
-        return []
-
-def get_device_trust():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT device_id, rssi, inter_packet_delay, received_at, is_legitimate
-            FROM heartbeats ORDER BY id DESC LIMIT 100
-        """)
-        rows = cur.fetchall()
-        conn.close()
-        # Build per-device latest stats
-        seen = {}
-        for r in rows:
-            did = r['device_id']
-            if did not in seen:
-                score = 100.0 if r['is_legitimate'] == 1 else 20.0
-                seen[did] = {
-                    "device_id": did,
-                    "score": score,
-                    "rssi": r['rssi'],
-                    "ipd": r['inter_packet_delay'],
-                    "last_seen": r['received_at'],
-                    "status": "AUTHENTICATED" if r['is_legitimate'] == 1 else "DENIED"
-                }
-        return list(seen.values())
-    except Exception as e:
-        print(f"[dashboard] get_device_trust error: {e}")
-        return []
-
-
-def get_threat_level() -> dict:
-    """
-    Determines the current system threat level by inspecting recent alerts.
-    Returns: {"level": "SECURE"|"HEARTBEAT_LOST"|"THERMAL_BREACH"|"LOCKDOWN", "detail": str}
-    """
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        since = int(time.time()) - 60  # last 60 seconds
-        cur.execute("""
-            SELECT event_type FROM alerts WHERE timestamp > ? ORDER BY id DESC LIMIT 20
-        """, (since,))
-        recent_types = [r[0] for r in cur.fetchall()]
-        conn.close()
-
-        if "TAMPER" in recent_types:
-            return {"level": "LOCKDOWN",        "detail": "Kinetic tamper detected — keys wiped"}
-        if "THERMAL" in recent_types:
-            return {"level": "THERMAL_BREACH",  "detail": "Thermal sabotage detected"}
-        if "REJECTED" in recent_types:
-            return {"level": "THREAT",           "detail": "Access denied — spoofing attempt"}
-        return  {"level": "SECURE",             "detail": "All systems nominal"}
-    except Exception as e:
-        print(f"[dashboard] get_threat_level error: {e}")
-        return {"level": "UNKNOWN", "detail": str(e)}
-
-
-DASHBOARD_HTML = """<!DOCTYPE html>
+DASHBOARD_HTML = """
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Zero-Trust IoT — Command Center</title>
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@700;900&display=swap" rel="stylesheet">
-<style>
-:root{--bg:#050a0e;--panel:#0d1117;--border:#1a2a1a;--g:#00ff41;--gd:#00aa2a;--r:#ff2244;--y:#ffd700;--c:#00e5ff;--o:#ff8c00;--tx:#c9d1d9;--txd:#586069}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--g);font-family:'Share Tech Mono',monospace;min-height:100vh;overflow-x:hidden;transition:background 0.6s}
-body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,65,.012) 2px,rgba(0,255,65,.012) 4px);pointer-events:none;z-index:9998}
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zero-Trust Command Center</title>
+  <meta name="description" content="Real-time Zero-Trust IoT Security monitoring dashboard with AI hardware fingerprinting and blockchain forensic evidence logging." />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:        #0d0f14;
+      --surface:   #161b27;
+      --border:    #1f2937;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --green:     #10b981;
+      --yellow:    #f59e0b;
+      --red:       #ef4444;
+      --blue:      #3b82f6;
+      --cyan:      #06b6d4;
+      --purple:    #8b5cf6;
+      --radius:    12px;
+      --shadow:    0 8px 32px rgba(0,0,0,.5);
+    }
 
-/* HEADER */
-header{background:linear-gradient(90deg,#050a0e,#0a1a0a,#050a0e);border-bottom:1px solid var(--gd);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
-header h1{font-family:'Orbitron',sans-serif;font-size:17px;color:var(--g);letter-spacing:3px;text-shadow:0 0 18px var(--g)}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--g);margin-right:8px;box-shadow:0 0 7px var(--g);animation:pulse 1.4s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
-#clock{font-size:12px;color:var(--gd)}
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* THREAT BANNER */
-#threat-banner{display:none;position:fixed;bottom:0;left:0;right:0;text-align:center;padding:10px;font-family:'Orbitron',sans-serif;font-size:13px;font-weight:900;letter-spacing:2px;z-index:9999;transition:all .4s}
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
 
-/* GRID */
-.wrap{padding:16px 20px;display:flex;flex-direction:column;gap:14px}
-.row{display:grid;gap:14px}
-.r4{grid-template-columns:repeat(4,1fr)}
-.r3{grid-template-columns:1.5fr 1fr 1fr}
-.r2{grid-template-columns:1fr 1.6fr}
+    /* ── HEADER ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 1.25rem 2.5rem;
+      background: rgba(22, 27, 39, 0.8);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      background: linear-gradient(90deg, var(--cyan), var(--blue));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+      font-size: .85rem;
+      font-weight: 600;
+      color: var(--text);
+      background: rgba(255,255,255,0.05);
+      padding: 0.5rem 1rem;
+      border-radius: 99px;
+      border: 1px solid var(--border);
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 10px var(--green);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity: 1; box-shadow: 0 0 10px var(--green); } 
+      50% { opacity: .4; box-shadow: 0 0 2px var(--green); }
+    }
 
-/* STAT CARDS */
-.stat{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:18px;position:relative;overflow:hidden}
-.stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--g),transparent)}
-.stat.r::before{background:linear-gradient(90deg,transparent,var(--r),transparent)}
-.stat.y::before{background:linear-gradient(90deg,transparent,var(--y),transparent)}
-.stat.c::before{background:linear-gradient(90deg,transparent,var(--c),transparent)}
-.slabel{font-size:9px;color:var(--txd);letter-spacing:2px;text-transform:uppercase;margin-bottom:6px}
-.sval{font-family:'Orbitron',sans-serif;font-size:32px;color:var(--g);text-shadow:0 0 12px var(--g)}
-.stat.r .sval{color:var(--r);text-shadow:0 0 12px var(--r)}
-.stat.y .sval{color:var(--y);text-shadow:0 0 12px var(--y)}
-.stat.c .sval{color:var(--c);text-shadow:0 0 12px var(--c)}
+    /* ── LAYOUT ── */
+    main {
+      display: grid;
+      grid-template-columns: repeat(12, 1fr);
+      gap: 1.5rem;
+      padding: 2rem 2.5rem;
+      max-width: 1600px;
+      margin: 0 auto;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      position: relative;
+      overflow: hidden;
+    }
+    /* Grid span helpers */
+    .col-4  { grid-column: span 4; }
+    .col-6  { grid-column: span 6; }
+    .col-8  { grid-column: span 8; }
+    .col-12 { grid-column: span 12; }
 
-/* PANELS */
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px}
-.panel h3{font-size:10px;color:var(--txd);letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+    .card h2 {
+      font-size: .75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: var(--muted);
+      margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
 
-/* CAMERA */
-#cam-wrap{text-align:center;position:relative}
-#cam-img{width:100%;max-height:220px;object-fit:cover;border-radius:6px;border:1px solid var(--gd);display:block}
-#cam-placeholder{width:100%;height:200px;background:#0a0a0a;border:1px dashed var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--txd);font-size:12px}
-#cam-timestamp{font-size:9px;color:var(--txd);margin-top:6px}
-.rgb-badge{display:inline-block;padding:2px 10px;border-radius:3px;font-size:10px;font-weight:bold;margin-top:6px;letter-spacing:1px}
+    /* ── ATTACK COUNTER ── */
+    .counter-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      height: 100%;
+    }
+    .counter-item {
+      background: rgba(255,255,255,.02);
+      border: 1px solid rgba(255,255,255,.05);
+      border-radius: 8px;
+      padding: 1.5rem 1rem;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .counter-num {
+      font-size: 2.8rem;
+      font-weight: 700;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1;
+      text-shadow: 0 0 20px currentColor;
+    }
+    .counter-label { font-size: .75rem; color: var(--muted); margin-top: .5rem; font-weight: 600; }
 
-/* TRUST BARS */
-.tcard{background:rgba(0,255,65,.03);border:1px solid var(--border);border-radius:5px;padding:12px;margin-bottom:8px}
-.thead2{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-.dname{font-size:12px;color:var(--g)}
-.badge{font-size:9px;padding:2px 7px;border-radius:3px;font-weight:bold}
-.ba{background:rgba(0,255,65,.12);color:var(--g);border:1px solid var(--gd)}
-.bd{background:rgba(255,34,68,.12);color:var(--r);border:1px solid var(--r)}
-.bar-bg{background:#1a2a1a;border-radius:3px;height:6px;margin-bottom:4px}
-.bar{height:6px;border-radius:3px;background:linear-gradient(90deg,var(--gd),var(--g));box-shadow:0 0 6px var(--g);transition:width .6s}
-.bar.low{background:linear-gradient(90deg,#880000,var(--r));box-shadow:0 0 6px var(--r)}
-.tmeta{font-size:9px;color:var(--txd);display:flex;justify-content:space-between}
+    /* ── CAMERA PANEL ── */
+    .camera-container {
+      width: 100%;
+      aspect-ratio: 4/3;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      position: relative;
+      border: 1px solid var(--border);
+    }
+    .camera-container img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      filter: contrast(1.1);
+    }
+    .camera-overlay {
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      padding: 0.75rem;
+      background: linear-gradient(transparent, rgba(0,0,0,0.9));
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.7rem;
+      color: var(--cyan);
+      display: flex;
+      justify-content: space-between;
+    }
+    .rec-indicator {
+      position: absolute;
+      top: 10px; right: 10px;
+      color: var(--red);
+      font-weight: bold;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      text-shadow: 0 0 5px black;
+    }
 
-/* EVENT FEED */
-.erow{display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(26,42,26,.4);font-size:10px;align-items:flex-start}
-.erow:last-child{border-bottom:none}
-.etype{min-width:80px;padding:2px 5px;border-radius:2px;text-align:center;font-size:8px;font-weight:bold;letter-spacing:.5px}
-.type-TAMPER{background:rgba(255,34,68,.2);color:var(--r);border:1px solid var(--r)}
-.type-REJECTED{background:rgba(255,215,0,.15);color:var(--y);border:1px solid var(--y)}
-.type-AUTHENTICATED{background:rgba(0,255,65,.08);color:var(--g);border:1px solid var(--gd)}
-.type-THERMAL{background:rgba(255,100,0,.2);color:#ff6400;border:1px solid #ff6400}
-.type-ACOUSTIC_ATTACK{background:rgba(148,0,211,.25);color:#da70d6;border:1px solid #9400d3}
-.edev{color:var(--gd);font-size:9px}
-.edet{color:var(--tx);flex:1}
+    /* ── PHYSICAL SECURITY (Arduino) ── */
+    .sensor-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+    }
+    .sensor-card {
+      background: rgba(255,255,255,.02);
+      border-left: 4px solid var(--border);
+      padding: 1rem;
+      border-radius: 0 8px 8px 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .sensor-card.safe { border-left-color: var(--green); }
+    .sensor-card.alert { border-left-color: var(--red); background: rgba(239,68,68,0.1); }
+    .sensor-value { font-family: 'JetBrains Mono', monospace; font-size: 1.5rem; font-weight: 700; }
+    .sensor-label { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
 
-/* BLOCKCHAIN TABLE */
-table{width:100%;border-collapse:collapse;font-size:10px}
-th{color:var(--txd);text-align:left;padding:6px;border-bottom:1px solid var(--border);font-size:9px;letter-spacing:1px}
-td{padding:6px;border-bottom:1px solid rgba(26,42,26,.25);color:var(--tx)}
-td.hash{color:var(--c);font-size:9px}
-td.ok{color:var(--g)}
-td.pend{color:var(--txd)}
+    /* ── TRUST GAUGES ── */
+    .device-list { display: flex; flex-direction: column; gap: 1rem; }
+    .device-row { 
+      display: flex; flex-direction: column; gap: .5rem; 
+      padding: 1rem;
+      background: rgba(255,255,255,0.02);
+      border-radius: 8px;
+    }
+    .device-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: .85rem;
+    }
+    .device-id { font-family: 'JetBrains Mono', monospace; font-weight: 700; }
+    .trust-bar {
+      height: 12px;
+      border-radius: 99px;
+      background: rgba(0,0,0,0.5);
+      border: 1px solid rgba(255,255,255,0.1);
+      overflow: hidden;
+      box-shadow: inset 0 2px 4px rgba(0,0,0,0.5);
+    }
+    .trust-fill {
+      height: 100%;
+      border-radius: 99px;
+      transition: width .8s cubic-bezier(0.4, 0, 0.2, 1), background .8s ease;
+      box-shadow: inset 0 2px 4px rgba(255,255,255,0.3);
+    }
 
-/* ATTACK SUMMARY */
-.asrow{margin-bottom:14px}
-.asval{font-size:24px;text-shadow:0 0 8px var(--r);color:var(--r)}
-.asval.y{color:var(--y);text-shadow:0 0 8px var(--y)}
-footer{text-align:center;padding:10px;color:var(--txd);font-size:9px;border-top:1px solid var(--border);margin-top:8px}
-</style>
+    /* ── EVENT FEED ── */
+    .feed { height: 350px; overflow-y: auto; display: flex; flex-direction: column; gap: .5rem; padding-right: 5px; }
+    .feed::-webkit-scrollbar { width: 6px; }
+    .feed::-webkit-scrollbar-track { background: transparent; }
+    .feed::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+    .event-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 1rem;
+      padding: .85rem 1rem;
+      border-radius: 8px;
+      background: rgba(255,255,255,.02);
+      border-left: 3px solid transparent;
+      font-size: .8rem;
+      animation: fadeIn .4s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; } }
+    .event-badge {
+      font-size: .7rem;
+      font-weight: 700;
+      padding: .3rem .6rem;
+      border-radius: 4px;
+      white-space: nowrap;
+      width: 120px;
+      text-align: center;
+    }
+    .badge-auth   { background: rgba(16,185,129,.15); color: var(--green); }
+    .badge-reject { background: rgba(239,68,68,.15);  color: var(--red); }
+    .badge-warn   { background: rgba(245,158,11,.15); color: var(--yellow); }
+    .badge-therm  { background: rgba(239,68,68,.25);  color: #ff6060; }
+    .badge-tamper { background: var(--red); color: #fff; box-shadow: 0 0 10px var(--red); animation: pulse 1s infinite; }
+    
+    .event-device { font-family: 'JetBrains Mono', monospace; color: var(--cyan); font-weight: 600;}
+    .event-reason { color: var(--muted); font-size: .75rem; margin-top: .3rem; }
+    .event-time   { font-size: .7rem; color: var(--muted); margin-left: auto; white-space: nowrap; }
+
+    /* ── EVIDENCE TABLE ── */
+    .table-container { height: 350px; overflow-y: auto; overflow-x: auto;}
+    .table-container::-webkit-scrollbar { width: 6px; height: 6px;}
+    .table-container::-webkit-scrollbar-track { background: transparent; }
+    .table-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+    
+    .evidence-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: .8rem; }
+    .evidence-table th {
+      text-align: left; padding: .85rem 1rem;
+      color: var(--muted); font-size: .7rem; text-transform: uppercase;
+      border-bottom: 2px solid var(--border);
+      position: sticky; top: 0; background: var(--surface); z-index: 10;
+    }
+    .evidence-table td { padding: .85rem 1rem; border-bottom: 1px solid rgba(255,255,255,.04); }
+    .evidence-table tr:hover td { background: rgba(255,255,255,.03); }
+    .hash { font-family: 'JetBrains Mono', monospace; font-size: .7rem; color: var(--purple); background: rgba(139,92,246,0.1); padding: 2px 6px; border-radius: 4px;}
+
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: .75rem;
+      padding: 2rem;
+      grid-column: span 12;
+      border-top: 1px solid var(--border);
+      margin-top: 2rem;
+    }
+
+    /* ── INTRUDER ALERT GALLERY ── */
+    .intruder-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 1rem;
+      max-height: 340px;
+      overflow-y: auto;
+    }
+    .intruder-card {
+      background: rgba(239,68,68,0.08);
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      animation: fadeIn .4s ease;
+    }
+    .intruder-card img {
+      width: 100%;
+      aspect-ratio: 4/3;
+      object-fit: cover;
+      background: #111;
+    }
+    .intruder-meta {
+      padding: .5rem;
+      font-size: .65rem;
+      color: var(--muted);
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1.4;
+    }
+    .intruder-meta .uid { color: var(--red); font-weight: 700; }
+    .no-intruders {
+      color: var(--green);
+      font-size: .85rem;
+      padding: 2rem;
+      text-align: center;
+      opacity: .7;
+    }
+  </style>
 </head>
 <body>
-<header>
-  <h1><span class="dot"></span>&#x1F6E1;&#xFE0F; ZERO-TRUST IoT SECURITY COMMAND CENTER</h1>
-  <div id="clock">SYSTEM ONLINE | <span id="ts"></span> | LIVE</div>
-</header>
+  <header>
+    <h1>
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+      ZERO-TRUST SECURITY GATEWAY
+    </h1>
+    <div class="status-pill" id="threat-pill">
+      <div class="dot" id="threat-dot"></div>
+      <span id="threat-status">SYSTEM SECURE</span>
+      <span style="color:var(--muted)">|</span>
+      <span id="clock" style="font-family:'JetBrains Mono',monospace">—</span>
+    </div>
+  </header>
 
-<div id="threat-banner"></div>
-
-<div class="wrap">
-  <!-- STAT CARDS -->
-  <div class="row r4">
-    <div class="stat c"><div class="slabel">Total Traffic</div><div class="sval" id="s-traffic">--</div><div style="font-size:9px;color:var(--txd);margin-top:4px">packets logged</div></div>
-    <div class="stat"><div class="slabel">Active Devices</div><div class="sval" id="s-dev">--</div><div style="font-size:9px;color:var(--txd);margin-top:4px">connected nodes</div></div>
-    <div class="stat r"><div class="slabel">Events Blocked</div><div class="sval" id="s-blocked">--</div><div style="font-size:9px;color:var(--r);margin-top:4px">access denied</div></div>
-    <div class="stat y"><div class="slabel">Thermal Alerts</div><div class="sval" id="s-thermal">--</div><div style="font-size:9px;color:var(--y);margin-top:4px">temp events</div></div>
-  </div>
-
-  <!-- MAIN ROW: Camera | Trust | Events -->
-  <div class="row r3">
-
-    <!-- CAMERA PANEL -->
-    <div class="panel">
-      <h3>&#x1F4F8; Sentry Camera — Live Capture</h3>
-      <div id="cam-wrap">
-        <div id="cam-placeholder">&#x1F4F7; No capture yet — awaiting RFID scan</div>
-        <img id="cam-img" src="" alt="Sentry capture" style="display:none">
-        <div id="cam-timestamp"></div>
-        <div id="rgb-badge-wrap"></div>
+  <main>
+    <!-- TOP ROW: Counters & Camera -->
+    <div class="card col-8">
+      <h2>🛡️ AI Threat Radar (CNN-LSTM)</h2>
+      <div class="counter-grid">
+        <div class="counter-item">
+          <div class="counter-num" id="cnt-total" style="color:var(--cyan)">—</div>
+          <div class="counter-label">TOTAL ACCESS ATTEMPTS</div>
+        </div>
+        <div class="counter-item">
+          <div class="counter-num" id="cnt-rejected" style="color:var(--red)">—</div>
+          <div class="counter-label">ATTACKS BLOCKED TODAY</div>
+        </div>
+        <div class="counter-item">
+          <div class="counter-num" id="cnt-auth" style="color:var(--green)">—</div>
+          <div class="counter-label">AUTHENTICATED</div>
+        </div>
+        <div class="counter-item">
+          <div class="counter-num" id="cnt-score" style="color:var(--yellow)">—</div>
+          <div class="counter-label">CURRENT THREAT LEVEL</div>
+        </div>
       </div>
-      <!-- RGB Challenge status -->
-      <div style="margin-top:12px;font-size:10px;color:var(--txd)">
-        <span id="rgb-status">RGB Challenge: Idle</span>
+    </div>
+
+    <div class="card col-4">
+      <h2>📷 Perimeter Edge Node (ESP32-CAM)</h2>
+      <div class="camera-container">
+        <!-- Defaults to a specific device ID you flash, e.g. ESP32_CAM_PERIMETER -->
+        <img id="live-cam" src="/api/photo/ESP32_CAM_PERIMETER" onerror="this.src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='" alt="Live Camera Feed">
+        <div class="rec-indicator"><div class="dot" style="background:var(--red);box-shadow:none;width:6px;height:6px"></div> LIVE</div>
+        <div class="camera-overlay">
+          <span>RGB CHALLENGE: ARMED</span>
+          <span id="cam-time">00:00:00</span>
+        </div>
       </div>
     </div>
 
-    <!-- TRUST SCORES -->
-    <div class="panel">
-      <h3>&#x1F512; Live Hardware Trust Scores</h3>
-      <div id="trust" style="max-height:340px;overflow-y:auto"><div style="color:var(--txd);font-size:11px">Waiting for device data...</div></div>
+    <!-- MIDDLE ROW: Arduino Sensors & Node Trust -->
+    <div class="card col-4">
+      <h2>🔥 Physical Watchdog (Arduino Uno)</h2>
+      <div class="sensor-grid">
+        <div class="sensor-card safe" id="card-vib">
+          <div>
+            <div class="sensor-label">Case Vibration (SW-420)</div>
+            <div style="font-size:0.8rem;color:var(--muted);margin-top:4px" id="vib-status">Monitoring...</div>
+          </div>
+          <div class="sensor-value" id="val-vib" style="color:var(--green)">SAFE</div>
+        </div>
+        <div class="sensor-card safe" id="card-temp">
+          <div>
+            <div class="sensor-label">Room Ambient (DHT22)</div>
+            <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">Humidity: <span id="val-hum">—</span>%</div>
+          </div>
+          <div class="sensor-value" id="val-temp" style="color:var(--cyan)">—°C</div>
+        </div>
+        <div class="sensor-card safe" id="card-kill">
+          <div>
+            <div class="sensor-label">Hardware Kill-Switch</div>
+            <div style="font-size:0.8rem;color:var(--muted);margin-top:4px">Pin 7 Relay Status</div>
+          </div>
+          <div class="sensor-value" id="val-kill" style="color:var(--green)">ARMED</div>
+        </div>
+      </div>
     </div>
 
-    <!-- ATTACK SUMMARY -->
-    <div class="panel">
-      <h3>&#x1F6A8; Tamper / Attack Summary</h3>
-      <div class="asrow"><div class="slabel">Wi-Fi Jamming (Heartbeat Loss)</div><div class="asval" id="a-jam">--</div></div>
-      <div class="asrow"><div class="slabel">Physical Tamper (SW-420)</div><div class="asval" id="a-tamp">--</div></div>
-      <div class="asrow"><div class="slabel">Thermal Sabotage (DHT22)</div><div class="asval y" id="a-therm">--</div></div>
-      <div class="asrow"><div class="slabel">AI Spoofing (Jitter Mismatch)</div><div class="asval" id="a-spoof">--</div></div>
-    </div>
-  </div>
-
-  <!-- SECOND ROW: Events | Blockchain -->
-  <div class="row r2">
-    <!-- EVENT FEED -->
-    <div class="panel">
-      <h3>&#x26A1; Security Event Feed</h3>
-      <div id="feed" style="max-height:260px;overflow-y:auto"><div style="color:var(--txd);font-size:11px">Monitoring...</div></div>
+    <div class="card col-8">
+      <h2>📡 Network Fingerprinting (MAC Spoof Defense)</h2>
+      <div class="device-list" id="device-list">
+        <p style="color:var(--muted);font-size:.8rem;padding:1rem">Awaiting neural network inference…</p>
+      </div>
     </div>
 
-    <!-- BLOCKCHAIN FORENSIC TABLE -->
-    <div class="panel">
-      <h3>&#x26D3;&#xFE0F; Blockchain Forensic Evidence — Immutable Audit Trail</h3>
-      <div style="overflow-x:auto">
-        <table>
-          <thead><tr><th>#</th><th>Device</th><th>SHA-256 Hash</th><th>Timestamp</th><th>TX Hash</th><th>Verified</th></tr></thead>
-          <tbody id="chain"></tbody>
+    <!-- BOTTOM ROW: Logs -->
+    <div class="card col-6">
+      <h2>🔴 Live Security Event Feed</h2>
+      <div class="feed" id="event-feed">
+        <p style="color:var(--muted);font-size:.8rem;padding:1rem">Waiting for events…</p>
+      </div>
+    </div>
+
+    <div class="card col-6">
+      <h2>⛓️ Forensic Blockchain Ledger (Ganache)</h2>
+      <div class="table-container">
+        <table class="evidence-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Device</th>
+              <th>Result</th>
+              <th>Reason</th>
+              <th>SHA-256 Signature</th>
+            </tr>
+          </thead>
+          <tbody id="evidence-tbody">
+            <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:2rem">Loading blockchain data…</td></tr>
+          </tbody>
         </table>
       </div>
     </div>
-  </div>
-</div>
 
-<footer>ZERO-TRUST IoT SECURITY PLATFORM v4.0 &nbsp;|&nbsp; Hardware-to-Patent &nbsp;|&nbsp; Raspberry Pi 5 &nbsp;|&nbsp; Ganache Blockchain &nbsp;|&nbsp; AI LSTM Fingerprinting</footer>
+    <!-- INTRUDER ALERT PANEL -->
+    <div class="card col-12">
+      <h2>🚨 Intruder Alert — Denied Access Photos</h2>
+      <div class="intruder-grid" id="intruder-grid">
+        <div class="no-intruders">✅ No denied access attempts recorded.</div>
+      </div>
+    </div>
 
-<script>
-// Clock
-setInterval(()=>{ document.getElementById('ts').textContent=new Date().toLocaleTimeString(); }, 1000);
-document.getElementById('ts').textContent=new Date().toLocaleTimeString();
+    <footer>
+      Zero-Trust IoT Security Architecture &nbsp;|&nbsp; 
+      Hardware-to-Patent Implementation &nbsp;|&nbsp; 
+      Auto-refreshing Dashboard
+    </footer>
+  </main>
 
-// ── Threat Level ─────────────────────────────────────────────────────────────
-const TH = {
-  SECURE:         {bg:'#050a0e', banner:null},
-  THREAT:         {bg:'#1a0800', banner:{bg:'#ff6400',tx:'#000'}},
-  HEARTBEAT_LOST: {bg:'#2a1000', banner:{bg:'#ff8c00',tx:'#000'}},
-  THERMAL_BREACH: {bg:'#1a0500', banner:{bg:'#ff2244',tx:'#fff'}},
-  LOCKDOWN:       {bg:'#000000', banner:{bg:'#ff2244',tx:'#fff'}},
-  UNKNOWN:        {bg:'#050a0e', banner:null},
-};
-async function pollThreat(){
-  try{
-    const d=await(await fetch('/api/threat_level')).json();
-    const cfg=TH[d.level]||TH.UNKNOWN;
-    document.body.style.background=cfg.bg;
-    const b=document.getElementById('threat-banner');
-    if(cfg.banner){
-      b.style.display='block';
-      b.style.background=cfg.banner.bg;
-      b.style.color=cfg.banner.tx;
-      b.style.boxShadow=`0 0 20px ${cfg.banner.bg}`;
-      b.textContent=`\u26A0 ${d.level.replace(/_/g,' ')} \u2014 ${d.detail}`;
-    } else { b.style.display='none'; }
-  } catch(e){}
-}
-pollThreat(); setInterval(pollThreat, 2000);
-
-// ── Camera Feed ───────────────────────────────────────────────────────────────
-async function pollCamera(){
-  try{
-    const d=await(await fetch('/api/camera')).json();
-    if(d.image_b64){
-      const img=document.getElementById('cam-img');
-      const ph=document.getElementById('cam-placeholder');
-      img.src='data:image/jpeg;base64,'+d.image_b64;
-      img.style.display='block'; ph.style.display='none';
-      document.getElementById('cam-timestamp').textContent=
-        'Last capture: '+new Date(d.timestamp*1000).toLocaleTimeString()+' | Device: '+(d.device_id||'?');
-      if(d.rgb_color){
-        const colors={RED:'#ff2244',GREEN:'#00ff41',BLUE:'#0088ff',CYAN:'#00e5ff',YELLOW:'#ffd700',MAGENTA:'#ff00ff'};
-        const c=colors[d.rgb_color]||'#888';
-        document.getElementById('rgb-badge-wrap').innerHTML=
-          `<span class="rgb-badge" style="background:${c}22;color:${c};border:1px solid ${c}">RGB: ${d.rgb_color}</span>`;
-        document.getElementById('rgb-status').textContent='RGB Challenge: '+d.rgb_status;
-      }
+  <script>
+    // ── Clock ──
+    function tick() {
+      const now = new Date();
+      document.getElementById('clock').textContent = now.toLocaleTimeString();
+      document.getElementById('cam-time').textContent = now.toLocaleTimeString('en-US', {hour12:false}) + '.' + String(now.getMilliseconds()).padStart(3,'0');
     }
-  } catch(e){}
-}
-pollCamera(); setInterval(pollCamera, 3000);
+    setInterval(tick, 50);
 
-// ── Main Data ─────────────────────────────────────────────────────────────────
-async function pollData(){
-  try{
-    const [sR,tR,eR,fR]=await Promise.all([
-      fetch('/api/stats'),fetch('/api/trust'),fetch('/api/events'),fetch('/api/forensic')
-    ]);
-    const [s,t,ev,f]=await Promise.all([sR.json(),tR.json(),eR.json(),fR.json()]);
+    // ── Camera Polling ──
+    // Appends timestamp to bypass browser cache
+    setInterval(() => {
+      const img = document.getElementById('live-cam');
+      img.src = '/api/photo/ESP32_CAM_PERIMETER?t=' + new Date().getTime();
+    }, 2000); // refresh every 2 seconds
 
-    // Stats
-    document.getElementById('s-traffic').textContent=s.total_traffic;
-    document.getElementById('s-dev').textContent=s.active_devices;
-    document.getElementById('s-blocked').textContent=s.events_blocked;
-    document.getElementById('s-thermal').textContent=s.thermal_alerts;
-    document.getElementById('a-jam').textContent=s.tamper_alerts||0;
-    document.getElementById('a-tamp').textContent=s.tamper_alerts||0;
-    document.getElementById('a-therm').textContent=s.thermal_alerts||0;
-    document.getElementById('a-spoof').textContent=s.events_blocked||0;
+    // ── Helpers ──
+    function fmt(ts) { return new Date(ts * 1000).toLocaleTimeString(); }
+    function trustColor(score) {
+      if (score >= 80) return 'var(--green)';
+      if (score >= 50) return 'var(--yellow)';
+      return 'var(--red)';
+    }
+    function badgeClass(result) {
+      if (result === 'AUTHENTICATED') return 'badge-auth';
+      if (result === 'REJECTED')      return 'badge-reject';
+      if (result === 'EMERGENCY_THERMAL') return 'badge-therm';
+      if (result === 'PHYSICAL_TAMPER') return 'badge-tamper';
+      return 'badge-warn';
+    }
+    function truncHash(h) { return h ? h.substring(0, 16) + '…' : '—'; }
 
-    // Trust gauges
-    const tEl=document.getElementById('trust');
-    tEl.innerHTML=t.length===0
-      ? '<div style="color:var(--txd);font-size:11px">No devices detected yet.</div>'
-      : t.map(d=>{
-          const p=Math.min(100,Math.max(0,d.score));
-          const low=p<50;
-          const bclass=d.status==='AUTHENTICATED'?'ba':'bd';
-          return `<div class="tcard">
-            <div class="thead2"><span class="dname">${d.device_id}</span><span class="badge ${bclass}">${d.status}</span></div>
-            <div class="bar-bg"><div class="bar ${low?'low':''}" style="width:${p}%"></div></div>
-            <div class="tmeta"><span>Trust: ${p.toFixed(1)}%</span><span>RSSI: ${d.rssi} dBm | IPD: ${d.ipd}ms</span></div>
-          </div>`;
+    // ── Threat Radar & Sensors ──
+    async function refreshSensors() {
+      try {
+        // Fetch Arduino environmental data
+        const rEnv = await fetch('/api/environment');
+        const env = await rEnv.json();
+        if (env.temperature != null) {
+          document.getElementById('val-temp').textContent = env.temperature.toFixed(1) + '°C';
+          document.getElementById('val-hum').textContent = env.humidity.toFixed(1);
+        }
+
+        // Fetch overall Threat Score
+        const rThreat = await fetch('/api/threat_level');
+        const threat = await rThreat.json();
+        document.getElementById('cnt-score').textContent = threat.threat_score + '%';
+        
+        const pill = document.getElementById('threat-pill');
+        const status = document.getElementById('threat-status');
+        const dot = document.getElementById('threat-dot');
+        const vibCard = document.getElementById('card-vib');
+        const valVib = document.getElementById('val-vib');
+        const valKill = document.getElementById('val-kill');
+        const cardKill = document.getElementById('card-kill');
+
+        if (threat.color === 'RED') {
+          pill.style.borderColor = 'var(--red)';
+          status.style.color = 'var(--red)';
+          status.textContent = 'SYSTEM LOCKDOWN';
+          dot.style.background = 'var(--red)';
+          document.getElementById('cnt-score').style.color = 'var(--red)';
+          
+          if (threat.alerts && threat.alerts.includes('PHYSICAL_TAMPER')) {
+             vibCard.className = 'sensor-card alert';
+             valVib.textContent = 'TAMPER!';
+             valVib.style.color = 'var(--red)';
+             document.getElementById('vib-status').textContent = 'VIBRATION DETECTED';
+             
+             cardKill.className = 'sensor-card alert';
+             valKill.textContent = 'POWER CUT';
+             valKill.style.color = 'var(--red)';
+          }
+        } else if (threat.color === 'ORANGE' || threat.color === 'YELLOW') {
+          pill.style.borderColor = 'var(--yellow)';
+          status.style.color = 'var(--yellow)';
+          status.textContent = 'ELEVATED RISK';
+          dot.style.background = 'var(--yellow)';
+          document.getElementById('cnt-score').style.color = 'var(--yellow)';
+        } else {
+          pill.style.borderColor = 'var(--border)';
+          status.style.color = 'var(--text)';
+          status.textContent = 'SYSTEM SECURE';
+          dot.style.background = 'var(--green)';
+          document.getElementById('cnt-score').style.color = 'var(--green)';
+          
+          vibCard.className = 'sensor-card safe';
+          valVib.textContent = 'SAFE';
+          valVib.style.color = 'var(--green)';
+          document.getElementById('vib-status').textContent = 'Monitoring...';
+          
+          cardKill.className = 'sensor-card safe';
+          valKill.textContent = 'ARMED';
+          valKill.style.color = 'var(--green)';
+        }
+      } catch(e) { console.error(e); }
+    }
+
+    // ── Device gauges ──
+    async function refreshDevices() {
+      try {
+        const r = await fetch('/api/devices');
+        const devices = await r.json();
+        const el = document.getElementById('device-list');
+        if (!devices.length) return;
+        
+        el.innerHTML = devices.map(d => {
+          const score = Math.max(0, Math.min(100, d.trust_score));
+          const color = trustColor(score);
+          const status = d.status || 'UNKNOWN';
+          const shadow = score < 50 ? `box-shadow: 0 0 15px ${color}` : '';
+          return `
+            <div class="device-row" style="border-left: 4px solid ${color}; ${shadow}">
+              <div class="device-meta">
+                <span class="device-id">${d.device_id}</span>
+                <span style="color:${color};font-weight:700;font-size:1rem">${score.toFixed(1)}%</span>
+              </div>
+              <div class="trust-bar">
+                <div class="trust-fill" style="width:${score}%;background:${color}"></div>
+              </div>
+              <div style="font-size:.75rem;color:var(--muted);display:flex;justify-content:space-between">
+                <span>Network Jitter (IPD): <span style="color:var(--text)">${d.last_ipd ? d.last_ipd.toFixed(3) : '—'}s</span></span>
+                <span>Signal: <span style="color:var(--text)">${d.last_rssi ?? '—'} dBm</span></span>
+              </div>
+            </div>
+          `;
         }).join('');
+      } catch(e) {}
+    }
 
-    // Event feed
-    const fEl=document.getElementById('feed');
-    fEl.innerHTML=ev.length===0
-      ? '<div style="color:var(--txd);font-size:11px">No events yet.</div>'
-      : ev.map(e=>{
-          const t2=new Date(e.timestamp*1000).toLocaleTimeString();
-          return `<div class="erow">
-            <span class="etype type-${e.event_type}">${e.event_type}</span>
-            <div><div class="edev">${e.device_id} &nbsp;|&nbsp; ${t2}</div>
-            <div class="edet">${e.details||''}</div></div>
-          </div>`;
+    // ── Counters + Feed ──
+    async function refreshFeed() {
+      try {
+        const r = await fetch('/api/events?limit=30');
+        const data = await r.json();
+
+        document.getElementById('cnt-total').textContent    = data.total;
+        document.getElementById('cnt-rejected').textContent = data.rejected;
+        document.getElementById('cnt-auth').textContent     = data.authenticated;
+
+        const feed = document.getElementById('event-feed');
+        if (!data.events.length) return;
+        
+        feed.innerHTML = data.events.map(e => `
+          <div class="event-row">
+            <span class="event-badge ${badgeClass(e.result)}">${e.result}</span>
+            <div style="flex:1;min-width:0">
+              <div class="event-device">${e.device_id}</div>
+              <div class="event-reason">${e.reason || 'Hardware Profile Verified'}</div>
+            </div>
+            <span class="event-time">${fmt(e.timestamp)}</span>
+          </div>
+        `).join('');
+      } catch(e) {}
+    }
+
+    // ── Evidence table ──
+    async function refreshEvidence() {
+      try {
+        const r = await fetch('/api/evidence?limit=20');
+        const rows = await r.json();
+        const tbody = document.getElementById('evidence-tbody');
+        if (!rows.length) return;
+        
+        tbody.innerHTML = rows.map(row => {
+          const color = row.result === 'AUTHENTICATED' ? 'var(--green)' :
+                        row.result === 'REJECTED'      ? 'var(--red)' : 'var(--yellow)';
+          return `
+            <tr>
+              <td style="color:var(--muted)">${fmt(row.timestamp)}</td>
+              <td class="device-id" style="color:var(--cyan)">${row.device_id}</td>
+              <td style="color:${color};font-weight:600">${row.result}</td>
+              <td style="color:var(--muted);max-width:200px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${row.reason || ''}">${row.reason || '—'}</td>
+              <td><span class="hash" title="${row.event_hash}">${truncHash(row.event_hash)}</span></td>
+            </tr>
+          `;
         }).join('');
+      } catch(e) {}
+    }
 
-    // Blockchain table
-    document.getElementById('chain').innerHTML=f.length===0
-      ? '<tr><td colspan="6" style="color:var(--txd);text-align:center">No evidence yet.</td></tr>'
-      : f.map(r=>{
-          const hash=r.image_hash?r.image_hash.slice(0,18)+'...':'N/A';
-          const tx=r.blockchain_tx?r.blockchain_tx.slice(0,16)+'...':'Pending';
-          const ts=new Date(r.timestamp*1000).toLocaleString();
-          const ver=r.verified
-            ? '<span class="ok">\u2713 ON-CHAIN</span>'
-            : '<span class="pend">\u23F3 Pending</span>';
-          return `<tr>
-            <td>${r.id}</td><td>${r.device_id}</td>
-            <td class="hash">${hash}</td><td>${ts}</td>
-            <td class="hash">${tx}</td><td>${ver}</td>
-          </tr>`;
-        }).join('');
+    // ── Intruder photo gallery ──
+    async function refreshIntruders() {
+      try {
+        const r = await fetch('/api/deny_photos?limit=12');
+        const photos = await r.json();
+        const grid = document.getElementById('intruder-grid');
+        if (!photos.length) {
+          grid.innerHTML = '<div class="no-intruders">✅ No denied access attempts recorded.</div>';
+          return;
+        }
+        grid.innerHTML = photos.map(p => `
+          <div class="intruder-card">
+            <img src="/api/deny_photo_img?path=${encodeURIComponent(p.photo_path)}"
+                 onerror="this.style.display='none'" alt="Intruder">
+            <div class="intruder-meta">
+              <div class="uid">🆔 ${p.uid}</div>
+              <div>👤 ${p.name || 'UNKNOWN'}</div>
+              <div>❌ ${p.reason}</div>
+              <div style="margin-top:4px;color:var(--muted)">${new Date(p.timestamp).toLocaleString()}</div>
+            </div>
+          </div>
+        `).join('');
+      } catch(e) {}
+    }
 
-  } catch(e){ console.error(e); }
-}
-pollData(); setInterval(pollData, 3000);
-</script>
+    function refreshAll() {
+      refreshSensors();
+      refreshDevices();
+      refreshFeed();
+      refreshEvidence();
+      refreshIntruders();
+    }
+
+    refreshAll();
+    setInterval(refreshAll, 2500); // Fast refresh for live demo
+  </script>
 </body>
 </html>
 """
 
 
-@app.route('/api/camera')
-def api_camera():
-    """Serve the latest sentry camera capture as base64 for the dashboard."""
-    import base64, glob
-    evidence_dir = '/home/mridul/Master_IoT_Project/static/evidence'
-    jpgs = sorted(glob.glob(f'{evidence_dir}/capture_*.jpg'), key=os.path.getmtime, reverse=True)
-    if not jpgs:
-        return jsonify({'image_b64': None, 'device_id': None, 'timestamp': None,
-                        'rgb_color': None, 'rgb_status': 'No capture yet'})
-    latest = jpgs[0]
-    fname  = os.path.basename(latest)
-    parts  = fname.replace('capture_','').replace('.jpg','').rsplit('_', 1)
-    dev_id = parts[0] if len(parts) == 2 else 'unknown'
-    ts     = float(parts[1]) if len(parts) == 2 else os.path.getmtime(latest)
-    with open(latest, 'rb') as fh:
-        img_b64 = base64.b64encode(fh.read()).decode()
-    return jsonify({'image_b64': img_b64, 'device_id': dev_id, 'timestamp': ts,
-                    'rgb_color': None, 'rgb_status': 'Verified'})
+DASHBOARD_HTML = None  # Loaded from file below
 
-@app.route('/api/threat_level')
-def api_threat_level():
-    return jsonify(get_threat_level())
+def _load_template():
+    """Load the HTML template from disk (allows hot-reload during dev)."""
+    tpl_path = os.path.join(_BASE_DIR, "dashboard_template.html")
+    if os.path.exists(tpl_path):
+        with open(tpl_path, encoding="utf-8") as f:
+            return f.read()
+    # Fallback to old inline template
+    return DASHBOARD_HTML or "<h1>Dashboard template not found</h1>"
 
 
-@app.route('/')
+# ─────────────────────────────────────────────────────────────────────────────
+# API Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/")
 def index():
-    return render_template_string(DASHBOARD_HTML)
+    return render_template_string(_load_template())
 
-@app.route('/api/stats')
-def api_stats():
-    return jsonify(get_stats())
 
-@app.route('/api/trust')
-def api_trust():
-    return jsonify(get_device_trust())
+@app.route("/api/devices")
+def api_devices():
+    """Returns all known device statuses."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT device_id, status, trust_score, last_seen,
+                       last_rssi, last_ipd, connection_state
+                FROM device_status
+                ORDER BY last_seen DESC
+                """
+            ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    except sqlite3.OperationalError:
+        return jsonify([])
 
-@app.route('/api/events')
+
+@app.route("/api/events")
 def api_events():
-    return jsonify(get_recent_events())
+    """Returns recent access log events + summary counters."""
+    from flask import request as req
+    limit = int(req.args.get("limit", 50))
+    events = get_recent_access_log(limit)
+    thermal = get_thermal_alerts(limit)
 
-@app.route('/api/forensic')
-def api_forensic():
-    return jsonify(get_forensic_log())
+    # Merge and sort thermal alerts into the event feed
+    for t in thermal:
+        events.append({
+            "device_id": t["device_id"],
+            "result": "EMERGENCY_THERMAL",
+            "reason": t["details"],
+            "trust_score": None,
+            "timestamp": t["timestamp"],
+        })
+    events.sort(key=lambda e: e.get("timestamp", 0), reverse=True)
+
+    # Counters
+    all_events = get_recent_access_log(10000)
+    today_start = int(time.time()) - 86400
+    rejected = sum(1 for e in all_events if e["result"] == "REJECTED" and e["timestamp"] > today_start)
+    authenticated = sum(1 for e in all_events if e["result"] == "AUTHENTICATED")
+
+    return jsonify({
+        "events": events[:limit],
+        "total": len(all_events),
+        "rejected": rejected,
+        "authenticated": authenticated,
+        "thermal": len(thermal),
+    })
 
 
-if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("📊  ZERO-TRUST IoT SECURITY DASHBOARD")
-    print("="*60)
-    print(f"\n🌐 Open your browser at: http://0.0.0.0:5001")
-    print(f"📡 Auto-refresh: every 3 seconds")
-    print(f"💾 Database: {DB_PATH}")
-    print("\n✅ Dashboard ready.\n")
-    app.run(host='0.0.0.0', port=5001, debug=False)
+@app.route("/api/evidence")
+def api_evidence():
+    """Returns the forensic evidence log for the blockchain table."""
+    from flask import request as req
+    limit = int(req.args.get("limit", 50))
+    return jsonify(get_recent_access_log(limit))
+
+
+@app.route("/api/stats")
+def api_stats():
+    """Quick system health stats (compatible with iot_server /stats)."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM heartbeats")
+            heartbeats = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM evidence")
+            evidence = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(DISTINCT device_id) FROM heartbeats")
+            devices = cursor.fetchone()[0]
+        return jsonify({"heartbeats": heartbeats, "evidence": evidence, "devices": devices})
+    except sqlite3.OperationalError:
+        return jsonify({"heartbeats": 0, "evidence": 0, "devices": 0})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# New API Endpoints — Phase 2 Dashboard Expansion
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/sensors")
+def api_sensors():
+    """SW-420 and DHT22 sensor health status."""
+    try:
+        from pi_backend.defense_sensors import get_sensor_status
+        return jsonify(get_sensor_status())
+    except Exception as exc:
+        return jsonify({"error": str(exc), "gpio_available": False})
+
+
+@app.route("/api/tamper")
+def api_tamper():
+    """Recent SW-420 physical tamper events."""
+    try:
+        from pi_backend.defense_sensors import get_tamper_alerts
+        return jsonify(get_tamper_alerts(20))
+    except Exception as exc:
+        return jsonify([])
+
+
+@app.route("/api/fault")
+def api_fault():
+    """Recent laser-glitch / fault injection events."""
+    try:
+        from pi_backend.fault_detector import get_fault_events
+        return jsonify(get_fault_events(20))
+    except Exception as exc:
+        return jsonify([])
+
+
+@app.route("/api/threat_level")
+def api_threat_level():
+    """
+    Threat Radar — computes an aggregate threat level (0-100) for the UI.
+
+    Score factors:
+      • Devices with trust_score < 50 → +30 each
+      • REJECTED events in last 5 min → +5 each (capped at 40)
+      • Active thermal alerts         → +20 each (capped at 20)
+      • PHYSICAL_TAMPER events        → +50 (immediate RED)
+      • CLOCK_TAMPER events           → +30
+    """
+    threat = 0
+    alerts_active = []
+    now = int(time.time())
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+
+            # Low-trust devices
+            devices = conn.execute(
+                "SELECT device_id, trust_score FROM device_status "
+                "WHERE trust_score < 50"
+            ).fetchall()
+            for d in devices:
+                threat += 30
+                alerts_active.append(f"LOW_TRUST:{d['device_id']}({d['trust_score']:.0f})")
+
+            # Recent rejections (last 5 min)
+            rejected_count = conn.execute(
+                "SELECT COUNT(*) FROM access_log "
+                "WHERE result='REJECTED' AND timestamp > ?",
+                (now - 300,)
+            ).fetchone()[0]
+            threat += min(rejected_count * 5, 40)
+            if rejected_count:
+                alerts_active.append(f"REJECTED_x{rejected_count}")
+
+            # Thermal alerts
+            thermal = conn.execute(
+                "SELECT COUNT(*) FROM alerts "
+                "WHERE event_type IN ('EMERGENCY_THERMAL','SENSOR_TAMPER') "
+                "AND timestamp > ?",
+                (now - 300,)
+            ).fetchone()[0]
+            threat += min(thermal * 20, 20)
+            if thermal:
+                alerts_active.append(f"THERMAL_x{thermal}")
+
+            # Physical tamper
+            tamper = conn.execute(
+                "SELECT COUNT(*) FROM alerts "
+                "WHERE event_type='PHYSICAL_TAMPER' AND timestamp > ?",
+                (now - 300,)
+            ).fetchone()[0]
+            if tamper:
+                threat += 50
+                alerts_active.append("PHYSICAL_TAMPER")
+
+            # Clock tamper (NTP drift)
+            clock = conn.execute(
+                "SELECT COUNT(*) FROM alerts "
+                "WHERE event_type='CLOCK_TAMPER' AND timestamp > ?",
+                (now - 300,)
+            ).fetchone()[0]
+            if clock:
+                threat += 30
+                alerts_active.append("CLOCK_TAMPER")
+
+    except sqlite3.OperationalError:
+        pass
+
+    threat = min(threat, 100)
+
+    if threat >= 70:
+        color = "RED"
+    elif threat >= 35:
+        color = "ORANGE"
+    elif threat >= 10:
+        color = "YELLOW"
+    else:
+        color = "GREEN"
+
+    return jsonify({
+        "threat_score": threat,
+        "color":        color,
+        "alerts":       alerts_active,
+        "timestamp":    now,
+    })
+
+
+@app.route("/api/photo/<device_id>")
+def api_photo(device_id: str):
+    """
+    Returns the latest JPEG photo from the ESP32-CAM for this device.
+    The dashboard <img> tag polls this endpoint every 5 seconds.
+    """
+    jpeg = _latest_photos.get(device_id)
+    if jpeg is None:
+        jpeg = load_device_photo(device_id)
+    if jpeg:
+        return Response(jpeg, mimetype="image/jpeg")
+
+    # Return a 1×1 transparent placeholder when no photo exists yet
+    # (1×1 grey JPEG — minimal valid JPEG bytes)
+    placeholder = (
+        b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+        b"\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n"
+        b"\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d"
+        b"\x1a\x1c\x1c $.' \",#\x1c\x1c(7),01444\x1f'9=82<.342\x1eG\xc0\x00\x0b"
+        b"\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05"
+        b"\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03"
+        b"\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xfb"
+        b"\xd2\x8a(\x03\xff\xd9"
+    )
+    return Response(placeholder, mimetype="image/jpeg")
+
+
+@app.route("/api/environment")
+def api_environment():
+    """Latest DHT22 temperature and humidity reading."""
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM heartbeats WHERE device_id='PI_DHT22' "
+                "ORDER BY received_at DESC LIMIT 1"
+            ).fetchone()
+        if row:
+            return jsonify(dict(row))
+        return jsonify({"temperature": None, "humidity": None})
+    except sqlite3.OperationalError:
+        return jsonify({"temperature": None, "humidity": None})
+
+
+@app.route("/api/clock")
+def api_clock():
+    """Clock drift status from the RTC guard."""
+    try:
+        from pi_backend.clock_guard import check_clock_drift, is_clock_tampered
+        report = check_clock_drift()
+        report["tampered"] = is_clock_tampered()
+        return jsonify(report)
+    except Exception as exc:
+        return jsonify({"error": str(exc)})
+
+
+@app.route("/api/deny_photos")
+def api_deny_photos():
+    """
+    Returns the most recent DENY entries from access_log.json that have
+    a saved photo, newest first. Used by the Intruder Alert gallery panel.
+    """
+    from flask import request as req
+    limit = int(req.args.get("limit", 12))
+    log_file = os.path.join(os.path.dirname(_BASE_DIR), "access_log.json")
+    try:
+        with open(log_file) as f:
+            log = json.load(f)
+    except Exception:
+        return jsonify([])
+
+    denied = [
+        e for e in log
+        if e.get("decision") == "DENY" and e.get("photo_path")
+    ]
+    denied.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
+    return jsonify(denied[:limit])
+
+
+@app.route("/api/deny_photo_img")
+def api_deny_photo_img():
+    """
+    Serves a saved intruder JPEG by its absolute path.
+    The path must be inside the project photos/ directory (security check).
+    """
+    from flask import request as req, abort, send_file
+    raw_path = req.args.get("path", "")
+    photos_dir = os.path.join(os.path.dirname(_BASE_DIR), "photos")
+    abs_path   = os.path.realpath(raw_path)
+    # Security: only serve files that live inside the photos/ folder
+    if not abs_path.startswith(os.path.realpath(photos_dir)):
+        abort(403)
+    if not os.path.isfile(abs_path):
+        abort(404)
+    return send_file(abs_path, mimetype="image/jpeg")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    port = int(os.environ.get("DASHBOARD_PORT", "5001"))
+    print("\n" + "=" * 60)
+    print("  Zero-Trust IoT Security Dashboard")
+    print(f"  Open → http://localhost:{port}")
+    print("=" * 60 + "\n")
+    app.run(host="0.0.0.0", port=port, debug=False)

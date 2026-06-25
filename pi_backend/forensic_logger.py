@@ -19,7 +19,7 @@ DB_PATH = '/home/mridul/Master_IoT_Project/security.db'
 
 # Try to import blockchain bridge
 try:
-    from blockchain_bridge import register_event_on_chain, hash_event
+    from pi_backend.blockchain_bridge import log_to_chain as register_event_on_chain, hash_event
     BLOCKCHAIN_ENABLED = True
 except Exception as e:
     print(f"⚠️  Blockchain bridge unavailable: {e}. Running in local-only mode.")
@@ -105,6 +105,16 @@ def log_thermal(device_id: str, temp: float):
     log_event(device_id, "THERMAL", f"Temperature: {temp:.1f}°C — Emergency shutdown triggered.")
 
 
+def log_access_attempt(device_id: str, result: str, reason: str, trust_score: float, db_path: str = DB_PATH):
+    """
+    Specialized logger for heartbeat verification attempts.
+    Maps results to standard event types for the forensic trail.
+    """
+    event_type = "HEARTBEAT_REJECTED" if result == "REJECTED" else "HEARTBEAT_VERIFIED"
+    details = f"Trust: {trust_score:.2f} | Reason: {reason}"
+    return log_event(device_id, event_type, details)
+
+
 if __name__ == "__main__":
     print("\n" + "="*60)
     print("📋  FORENSIC LOGGER — STANDALONE TEST")
@@ -120,3 +130,20 @@ if __name__ == "__main__":
     log_thermal("VAULT_MONITOR_01", 71.2)
 
     print("\n✅ All events logged successfully.")
+
+def get_recent_access_log(limit=50):
+    """Retrieves recent access logs from the database for the dashboard."""
+    try:
+        conn = get_db()
+        cursor = conn.execute("""
+            SELECT device_id, event_type as result, details as reason, timestamp 
+            FROM alerts 
+            ORDER BY timestamp DESC 
+            LIMIT ?
+        """, (limit,))
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+    except Exception as e:
+        print(f"❌ Failed to fetch logs: {e}")
+        return []

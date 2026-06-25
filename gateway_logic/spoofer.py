@@ -16,7 +16,7 @@ from scapy.all import ARP, Ether, send, sendp, getmacbyip
 # ---------------------------------------------------------------------------
 import os
 ROUTER_IP  = os.environ.get("ROUTER_IP", "192.168.1.1")
-TARGET_IP  = os.environ.get("TARGET_IP", "192.168.1.113")
+TARGET_IP  = os.environ.get("TARGET_IP", "10.248.115.94")
 INTERFACE  = "wlan0"
 
 INTERVAL_S = 2   # seconds between poison packets

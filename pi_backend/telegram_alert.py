@@ -51,7 +51,7 @@ try:
     DASHBOARD_IP = s.getsockname()[0]
     s.close()
 except Exception:
-    DASHBOARD_IP = "192.168.1.105"
+    DASHBOARD_IP = os.environ.get("PI_LOCAL_IP", "10.238.130.161")
 
 # ---------------------------------------------------------------------------
 # TELEGRAM SENDER

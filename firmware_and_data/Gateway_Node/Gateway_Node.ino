@@ -13,13 +13,14 @@
 // 1. CONFIGURATION  ← FILL THESE IN
 // ==========================================
 
-// --- WiFi ---
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";      // ← your network name
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";  // ← your network password
+// --- WiFi (update to your mobile hotspot) ---
+// ⚠️  Replace with your actual hotspot SSID and password!
+const char* WIFI_SSID     = "Onki";              // ← mobile hotspot name
+const char* WIFI_PASSWORD = "123456789";          // ← mobile hotspot password
 
-// --- MQTT Broker (your Raspberry Pi IP) ---
-// Find with:  hostname -I   on the Pi
-const char* MQTT_SERVER = "192.168.1.113";  // ← Raspberry Pi IP
+// --- MQTT Broker (Raspberry Pi IP on hotspot network) ---
+// After Pi joins hotspot, run: hostname -I   to confirm new IP
+const char* MQTT_SERVER = "10.238.130.161";  // ← Pi MQTT Broker IP (wlan0)
 const int   MQTT_PORT   = 1883;
 
 // --- Device identity ---

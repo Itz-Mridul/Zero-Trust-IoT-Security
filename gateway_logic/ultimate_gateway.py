@@ -45,15 +45,15 @@ except Exception as _imp_err:
 # ---------------------------------------------------------------------------
 # Use env vars to override without editing this file
 INTERFACE           = os.environ.get("GATEWAY_IFACE", "wlan0")     # set to eth0 if wired
-GATEWAY_IP          = os.environ.get("GATEWAY_IP",    "192.168.1.113")  # Pi LAN IP
-COMMAND_CENTER_IP   = os.environ.get("GATEWAY_IP",    "192.168.1.113")  # Pi LAN IP
+GATEWAY_IP          = os.environ.get("PI_LOCAL_IP", os.environ.get("GATEWAY_IP", "10.238.130.161"))  # Pi LAN IP (wlan0)
+COMMAND_CENTER_IP   = os.environ.get("PI_LOCAL_IP", os.environ.get("GATEWAY_IP", "10.238.130.161"))  # Pi LAN IP (wlan0)
 COMMAND_CENTER_PORT = int(os.environ.get("DASHBOARD_PORT", "5000"))
 
 BANNED_DOMAINS = {"spacejam.com", "tiktok.com", "facebook.com"}
 
 TRUSTED_IPS: set[str] = {
-    "192.168.1.113",   # Pi (this machine)
-    "192.168.1.1",     # typical home router — adjust if different
+    GATEWAY_IP,
+    os.environ.get("MOBILE_IP", "10.238.130.38"),   # Mobile hotspot router/gateway
     "8.8.8.8",         # Google DNS
     "8.8.4.4",
     "127.0.0.1",

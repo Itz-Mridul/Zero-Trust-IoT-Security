@@ -1,23 +1,61 @@
+# ================================================================
+# Zero-Trust IoT Security Gateway — .gitignore
+# ================================================================
+
+# ── Secrets (NEVER commit these) ─────────────────────────────
 .env
-config.h
-*.db
-*.sqlite
-*.h5
-*.pkl
-*.log
+config.h                    # ESP32 WiFi/MQTT credentials
+
+# ── Python ───────────────────────────────────────────────────
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# ── Virtual environments ──────────────────────────────────────
 venv/
 .venv/
+env/
+
+# ── Node / Ganache ────────────────────────────────────────────
 node_modules/
-build/
+ganache_db/
+
+# ── ML models / binaries (large, regenerate with train_model.py)
+*.h5
+*.pkl
+*.onnx
+
+# ── Databases (runtime data — regenerated on boot) ───────────
+*.db
+*.sqlite
+*.db-journal
+
+# ── Compiled / build artifacts ────────────────────────────────
 *.bin
 *.elf
+build/
+dist/
+*.o
+
+# ── Logs (runtime) ────────────────────────────────────────────
+*.log
+logs/
+
+# ── Runtime state files ───────────────────────────────────────
+access_log.json
+photos/
 /mnt/vault_keys/
-config.h
-config.json
-ganache_db/
+
+# ── Editor junk ───────────────────────────────────────────────
 *.swp
 *.swo
 *~
 .DS_Store
-security.db-journal
+
+# ── pytest cache ─────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/

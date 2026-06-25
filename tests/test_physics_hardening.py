@@ -2,14 +2,17 @@
 """
 Test Physics Hardening Modules
 Validates key_vault, environment_monitor logic, and nonce_challenger.
+paho/MQTT-dependent tests skip gracefully when paho is not installed.
 """
 import os
 import sys
 import time
 import tempfile
+import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pi_backend"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "pi_backend"))
+sys.path.insert(0, ROOT)
 
 
 def test_key_vault_xor():
@@ -50,36 +53,37 @@ def test_key_vault_store_retrieve():
 
 def test_nonce_challenger_solution():
     """Test that nonce solution algorithm is deterministic."""
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pi_backend"))
+    try:
+        from pi_backend.nonce_challenger import expected_solution
+    except ImportError as e:
+        pytest.skip(f"nonce_challenger import failed (missing optional dep): {e}")
 
-    from nonce_challenger import expected_solution
-
-    # Test known values
-    assert expected_solution(0) == 0, "Solution for nonce=0 should be 0"
+    assert expected_solution(0) == 0,   "Solution for nonce=0 should be 0"
     assert expected_solution(1) == 999, "Solution for nonce=1 should be 999"
     assert expected_solution(500) == 500, "Solution for nonce=500 should be 500"
 
-    # Verify: (nonce + solution) % 1000 == 0
     for nonce in [0, 1, 42, 500, 999, 12345]:
         sol = expected_solution(nonce)
-        assert (nonce + sol) % 1000 == 0, f"Failed for nonce={nonce}: ({nonce}+{sol}) % 1000 != 0"
+        assert (nonce + sol) % 1000 == 0, \
+            f"Failed for nonce={nonce}: ({nonce}+{sol}) % 1000 != 0"
 
     print("✅ Nonce solution algorithm is correct and deterministic")
 
 
 def test_rate_of_rise_detection():
     """Test the environment monitor's rate-of-rise temperature logic."""
-    from pi_backend.environment_monitor import get_rate_of_rise, _cpu_temp_history
+    try:
+        from pi_backend.environment_monitor import get_rate_of_rise, _cpu_temp_history
+    except ImportError as e:
+        pytest.skip(f"environment_monitor import failed (missing dep): {e}")
 
     _cpu_temp_history.clear()
 
-    # Simulate gradual rise (normal)
     rise1 = get_rate_of_rise(50.0)
     rise2 = get_rate_of_rise(50.5)
     assert rise2 <= 1.0, f"Normal rise should be ≤1°C, got {rise2}"
     print(f"✅ Normal rise detected: {rise2:.2f}°C/poll (expected ≤1.0)")
 
-    # Simulate abrupt spike (acoustic attack)
     rise3 = get_rate_of_rise(55.0)
     assert rise3 > 3.0, f"Acoustic spike should be >3°C, got {rise3}"
     print(f"✅ Acoustic attack spike detected: {rise3:.2f}°C/poll (expected >3.0)")

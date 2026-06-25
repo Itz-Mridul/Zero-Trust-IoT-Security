@@ -82,6 +82,16 @@ try:
 except ImportError:  # pragma: no cover - keeps the HTTP server usable without MQTT
     mqtt = None
 
+# ── AI Authenticator (CNN-LSTM hardware fingerprinting) ───────────────────────
+try:
+    from pi_backend.ai_authenticator import predict_legitimacy as _ai_predict, reset_device_buffer as _ai_reset
+    _AI_AVAILABLE = True
+except Exception as _ai_exc:
+    print(f"[AI_AUTH] Skipping AI module: {_ai_exc}")
+    _AI_AVAILABLE = False
+    def _ai_predict(*a, **kw): return None
+    def _ai_reset(*a, **kw): pass
+
 try:
     from pathlib import Path
 except ImportError:  # pragma: no cover
@@ -628,22 +638,27 @@ def score_heartbeat(inter_packet_delay, rssi):
     except (TypeError, ValueError):
         signal = -100
 
-    perfect_window_low = EXPECTED_IPD_MS - 500
-    perfect_window_high = EXPECTED_IPD_MS + 500
+    # Thresholds relative to EXPECTED_IPD_MS — works at any heartbeat rate
+    too_fast    = EXPECTED_IPD_MS * 0.30   # < 30%  of expected → suspicious
+    slightly_fast = EXPECTED_IPD_MS * 0.75  # < 75%  → slightly fast
+    perfect_low = EXPECTED_IPD_MS * 0.85   # 85%-115% = perfect window
+    perfect_high = EXPECTED_IPD_MS * 1.15
+    slightly_late = EXPECTED_IPD_MS * 2.0  # < 200% → delayed
+    very_late   = EXPECTED_IPD_MS * 3.0    # > 300% → very late
 
-    if ipd < 1000:
+    if ipd < too_fast:
         penalty = -40.0 if signal >= -60 else -30.0
-        return penalty, "REJECTED", "Timing far too fast for a normal heartbeat"
+        return penalty, "REJECTED", "Timing far too fast — possible replay/spoof"
 
-    if ipd < 4000:
+    if ipd < slightly_fast:
         if signal <= -75:
             return -5.0, "WARNING", "Early packet softened by weak RSSI"
         return -25.0, "WARNING", "Early packet is spoofing-like"
 
-    if perfect_window_low <= ipd <= perfect_window_high:
+    if perfect_low <= ipd <= perfect_high:
         return 5.0, "AUTHENTICATED", "Heartbeat matches the expected cadence"
 
-    if ipd <= 9000:
+    if ipd <= slightly_late:
         if signal <= -75:
             return 0.0, "AUTHENTICATED", "Delayed packet forgiven because RSSI is weak"
         return -10.0, "WARNING", "Delayed packet on a strong link"
@@ -712,6 +727,7 @@ def evaluate_heartbeat(data):
         status = "ONLINE"
         current_state["status"] = "ONLINE"
         current_state["grace_period_until"] = grace_period_until
+        _ai_reset(device_id)  # Clear AI buffer so fresh connection gets clean baseline
 
     if current_state["status"] == "OFFLINE":
         # Trust is frozen while the device is offline. Do not decay it on stale
@@ -769,10 +785,28 @@ def evaluate_heartbeat(data):
     delta, classification, reason = score_heartbeat(inter_packet_delay, rssi)
     trust_score = clamp(trust_score + delta)
 
+    # ── CNN-LSTM AI Hardware Fingerprint Check ───────────────────────────────
+    ai_result = _ai_predict(device_id, data)
+    if ai_result is not None:
+        is_legit, ai_conf, buf_size = ai_result
+        if not is_legit:
+            # Attacker's timing jitter does not match real ESP32 hardware
+            ai_penalty = 50.0
+            trust_score = clamp(trust_score - ai_penalty)
+            classification = "REJECTED"
+            reason = (f"AI_SPOOFING: CNN-LSTM confidence={ai_conf:.1%} "
+                      f"(below threshold) — hardware fingerprint mismatch")
+            print(f"[AI_AUTH] 🚨 SPOOF BLOCKED | {device_id} | "
+                  f"trust now={trust_score:.1f} | AI_conf={ai_conf:.3f}")
+        else:
+            # Legitimate — small AI bonus
+            trust_score = clamp(trust_score + 2.0)
+    # ────────────────────────────────────────────────────────────────────────
+
     if trust_score < BLOCK_THRESHOLD:
         final_status = "REJECTED"
         confidence = trust_score
-        message = "Trust score fell below the block threshold"
+        message = reason if "AI_SPOOFING" in reason else "Trust score fell below the block threshold"
     elif classification == "WARNING":
         final_status = "WARNING"
         confidence = trust_score
@@ -799,7 +833,7 @@ def evaluate_heartbeat(data):
         grace_period_until=grace_period_until,
         connection_state=connection_state or current_state["connection_state"],
         status_source="heartbeat",
-        last_event=f"ipd_delta={delta}",
+        last_event=f"ipd_delta={delta}|ai_conf={ai_result[1]:.3f}" if ai_result else f"ipd_delta={delta}",
     ), 403 if final_status == "REJECTED" else 200, current_state
 
 
@@ -1231,5 +1265,11 @@ if __name__ == "__main__":
     print("   POST /verify - Receive heartbeats")
     print("   GET  /stats  - System statistics")
     print("\nServer ready. Waiting for ESP32 connections...\n")
-
-    app.run(host="0.0.0.0", port=5005, debug=False)
+    try:
+        app.run(host="0.0.0.0", port=5005, debug=False)
+    except (OSError, SystemExit) as e:
+        print(f"Flask exited or failed to bind to port 5005: {e}")
+        print("Keeping process alive for MQTT background services...")
+        import time
+        while True:
+            time.sleep(60)

@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zero-Trust IoT — Security Command Center</title>
+<meta name="description" content="Zero-Trust IoT Security Platform — Live blockchain forensics, AI trust scoring, intruder surveillance">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#070b14;--s1:#0d1220;--s2:#111827;--b:#1e2a3a;--t:#e2e8f0;--m:#64748b;--g:#10b981;--r:#ef4444;--y:#f59e0b;--c:#06b6d4;--p:#8b5cf6;--bl:#3b82f6;--rad:10px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--t);font-family:'Inter',sans-serif;min-height:100vh;display:flex;flex-direction:column}
+a{color:inherit;text-decoration:none}
+header{display:flex;align-items:center;justify-content:space-between;padding:.9rem 2rem;background:rgba(13,18,32,.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--b);position:sticky;top:0;z-index:100}
+.logo{font-size:1rem;font-weight:700;letter-spacing:1px;background:linear-gradient(90deg,var(--c),var(--p));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hpills{display:flex;gap:.75rem;align-items:center}
+.pill{display:flex;align-items:center;gap:.5rem;font-size:.78rem;font-weight:600;padding:.4rem .9rem;border-radius:99px;border:1px solid var(--b);background:rgba(255,255,255,.04)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--g);box-shadow:0 0 8px var(--g);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+#clock{font-family:'JetBrains Mono',monospace;font-size:.78rem;color:var(--m)}
+nav.tabs{display:flex;background:var(--s1);border-bottom:1px solid var(--b);padding:0 2rem;overflow-x:auto}
+nav.tabs button{padding:.85rem 1.25rem;font-size:.82rem;font-weight:600;color:var(--m);background:none;border:none;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap;transition:.2s}
+nav.tabs button.active{color:var(--c);border-bottom-color:var(--c)}
+nav.tabs button:hover:not(.active){color:var(--t)}
+main{flex:1;padding:1.5rem 2rem;max-width:1600px;margin:0 auto;width:100%}
+section{display:none}.section-active{display:block}
+.grid{display:grid;gap:1.25rem}
+.g4{grid-template-columns:repeat(4,1fr)}.g3{grid-template-columns:repeat(3,1fr)}.g2{grid-template-columns:1fr 1fr}.g21{grid-template-columns:2fr 1fr}
+@media(max-width:900px){.g4,.g3,.g2,.g21{grid-template-columns:1fr}}
+.card{background:var(--s1);border:1px solid var(--b);border-radius:var(--rad);padding:1.25rem;position:relative;overflow:hidden}
+.card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--c),var(--p))}
+.card h2{font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--m);margin-bottom:1rem;display:flex;align-items:center;gap:6px}
+.stat-num{font-size:2.5rem;font-weight:700;font-family:'JetBrains Mono',monospace;line-height:1}
+.stat-label{font-size:.75rem;color:var(--m);margin-top:.4rem}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:.7rem;font-weight:700;padding:.25rem .6rem;border-radius:6px}
+.badge-g{background:rgba(16,185,129,.15);color:var(--g)}.badge-r{background:rgba(239,68,68,.15);color:var(--r)}.badge-y{background:rgba(245,158,11,.15);color:var(--y)}.badge-b{background:rgba(59,130,246,.15);color:var(--bl)}.badge-p{background:rgba(139,92,246,.15);color:var(--p)}.badge-c{background:rgba(6,182,212,.15);color:var(--c)}
+.feed{height:300px;overflow-y:auto;display:flex;flex-direction:column;gap:.4rem}
+.feed::-webkit-scrollbar{width:4px}.feed::-webkit-scrollbar-thumb{background:var(--b);border-radius:4px}
+.ev{display:flex;align-items:flex-start;gap:.75rem;padding:.65rem .85rem;background:rgba(255,255,255,.02);border-radius:6px;border-left:3px solid var(--b)}
+.ev.grant{border-left-color:var(--g)}.ev.deny{border-left-color:var(--r)}.ev.warn{border-left-color:var(--y)}
+.ev-time{font-family:'JetBrains Mono',monospace;font-size:.65rem;color:var(--m);white-space:nowrap;margin-top:2px}
+.ev-body{flex:1}.ev-dev{font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace}.ev-reason{font-size:.72rem;color:var(--m);margin-top:2px}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th{text-align:left;padding:.6rem .75rem;font-size:.68rem;text-transform:uppercase;letter-spacing:1px;color:var(--m);border-bottom:1px solid var(--b)}
+td{padding:.65rem .75rem;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle}
+tr:hover td{background:rgba(255,255,255,.02)}
+.mono{font-family:'JetBrains Mono',monospace;font-size:.72rem}
+.trust-bar-wrap{height:8px;border-radius:4px;background:rgba(255,255,255,.08);overflow:hidden;margin-top:4px}
+.trust-fill{height:100%;border-radius:4px;transition:width .6s ease}
+.cam-box{aspect-ratio:4/3;background:#000;border-radius:8px;overflow:hidden;display:flex;align-items:center;justify-content:center;position:relative;border:1px solid var(--b)}
+.cam-box img{width:100%;height:100%;object-fit:cover}
+.cam-empty{color:var(--m);font-size:.8rem;text-align:center}
+.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1rem}
+.photo-card{border-radius:8px;overflow:hidden;border:1px solid var(--b);cursor:pointer;transition:transform .2s}
+.photo-card:hover{transform:scale(1.02)}
+.photo-card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block}
+.photo-meta{padding:.6rem;background:var(--s2);font-size:.7rem;color:var(--m)}
+.threat-ring{position:relative;width:140px;height:140px;margin:0 auto}
+.threat-ring svg{transform:rotate(-90deg)}circle.track{fill:none;stroke:rgba(255,255,255,.06);stroke-width:12}
+circle.fill{fill:none;stroke-width:12;stroke-linecap:round;transition:stroke-dashoffset .8s ease,stroke .8s ease}
+.threat-label{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.threat-score{font-size:1.8rem;font-weight:700;font-family:'JetBrains Mono',monospace}
+.threat-text{font-size:.65rem;color:var(--m);margin-top:2px}
+.sensor-row{display:flex;justify-content:space-between;align-items:center;padding:.75rem;background:rgba(255,255,255,.02);border-radius:6px;border-left:3px solid var(--g)}
+.sensor-row.alert{border-left-color:var(--r);background:rgba(239,68,68,.06)}
+.sensor-val{font-family:'JetBrains Mono',monospace;font-size:1.25rem;font-weight:700}
+.sensor-lbl{font-size:.7rem;color:var(--m)}
+.copy-btn{cursor:pointer;background:none;border:1px solid var(--b);border-radius:4px;color:var(--m);padding:2px 6px;font-size:.65rem;transition:.15s}
+.copy-btn:hover{color:var(--t);border-color:var(--c)}
+.no-data{text-align:center;padding:3rem;color:var(--m);font-size:.85rem}
+footer{text-align:center;padding:.75rem;font-size:.7rem;color:var(--m);border-top:1px solid var(--b)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">🛡 ZERO-TRUST IoT SECURITY COMMAND CENTER</div>
+  <div class="hpills">
+    <div class="pill"><div class="dot"></div>SYSTEM ONLINE</div>
+    <div class="pill" id="clock"></div>
+  </div>
+</header>
+<nav class="tabs" id="tabNav">
+  <button class="active" onclick="showTab('overview',this)">📊 Overview</button>
+  <button onclick="showTab('accesslog',this)">🔑 Access Log</button>
+  <button onclick="showTab('blockchain',this)">⛓ Blockchain</button>
+  <button onclick="showTab('gallery',this)">📸 Intruder Gallery</button>
+  <button onclick="showTab('health',this)">🖥 System Health</button>
+</nav>
+<main>
+<!-- ═══════════ OVERVIEW ═══════════ -->
+<section id="overview" class="section-active">
+  <div class="grid g4" style="margin-bottom:1.25rem">
+    <div class="card"><h2>📦 Total Events</h2><div class="stat-num" id="ov-total">—</div><div class="stat-label">packets logged</div></div>
+    <div class="card"><h2>📡 Active Devices</h2><div class="stat-num" id="ov-devices">—</div><div class="stat-label">connected nodes</div></div>
+    <div class="card"><h2>🚫 Access Denied</h2><div class="stat-num" id="ov-denied" style="color:var(--r)">—</div><div class="stat-label">unauthorized attempts</div></div>
+    <div class="card"><h2>✅ Access Granted</h2><div class="stat-num" id="ov-granted" style="color:var(--g)">—</div><div class="stat-label">authenticated entries</div></div>
+  </div>
+  <div class="grid g21" style="margin-bottom:1.25rem">
+    <div class="card">
+      <h2>🔴 Live Hardware Trust Scores</h2>
+      <div id="ov-devices-list"><div class="no-data">Waiting for devices...</div></div>
+    </div>
+    <div class="card">
+      <h2>⚠️ Threat Level</h2>
+      <div class="threat-ring">
+        <svg viewBox="0 0 140 140" width="140" height="140">
+          <circle class="track" cx="70" cy="70" r="54"/>
+          <circle class="fill" id="threat-arc" cx="70" cy="70" r="54" stroke-dasharray="339.3" stroke-dashoffset="339.3" stroke="var(--g)"/>
+        </svg>
+        <div class="threat-label"><div class="threat-score" id="threat-num">0</div><div class="threat-text" id="threat-text">SECURE</div></div>
+      </div>
+      <div id="threat-alerts" style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:.4rem"></div>
+    </div>
+  </div>
+  <div class="grid g2">
+    <div class="card">
+      <h2>📋 Recent Security Events</h2>
+      <div class="feed" id="ov-feed"><div class="no-data">No events yet</div></div>
+    </div>
+    <div class="card">
+      <h2>📷 Latest Sentry Capture</h2>
+      <div class="cam-box" id="ov-cam">
+        <div class="cam-empty">No capture yet — awaiting RFID scan</div>
+      </div>
+      <div style="font-size:.7rem;color:var(--m);margin-top:.5rem" id="ov-cam-label"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ ACCESS LOG ═══════════ -->
+<section id="accesslog">
+  <div class="card">
+    <h2>🔑 Full Access Log — All GRANT &amp; DENY Events</h2>
+    <div style="display:flex;gap:.75rem;margin-bottom:1rem;flex-wrap:wrap">
+      <input id="al-search" placeholder="Search by user, device, UID..." style="flex:1;min-width:200px;padding:.5rem .75rem;background:var(--s2);border:1px solid var(--b);border-radius:6px;color:var(--t);font-size:.8rem">
+      <select id="al-filter" style="padding:.5rem .75rem;background:var(--s2);border:1px solid var(--b);border-radius:6px;color:var(--t);font-size:.8rem">
+        <option value="">All Results</option><option value="AUTHENTICATED">Granted Only</option><option value="REJECTED">Denied Only</option>
+      </select>
+    </div>
+    <div style="overflow-x:auto">
+      <table id="al-table">
+        <thead><tr><th>#</th><th>Time</th><th>Device</th><th>Result</th><th>Reason</th><th>Trust</th><th>Event Hash</th></tr></thead>
+        <tbody id="al-body"><tr><td colspan="7" class="no-data">Loading...</td></tr></tbody>
+      </table>
+    </div>
+    <div style="font-size:.72rem;color:var(--m);margin-top:.75rem" id="al-count"></div>
+  </div>
+</section>
+
+<!-- ═══════════ BLOCKCHAIN ═══════════ -->
+<section id="blockchain">
+  <div class="grid g4" style="margin-bottom:1.25rem">
+    <div class="card"><h2>⛓ Network</h2><div class="stat-num" style="font-size:1.2rem;color:var(--c)">Ganache</div><div class="stat-label">Private Ethereum</div></div>
+    <div class="card"><h2>📄 Contract</h2><div class="mono" id="bc-contract" style="font-size:.68rem;margin-top:.25rem;word-break:break-all;color:var(--p)">Loading...</div></div>
+    <div class="card"><h2>📦 Total Records</h2><div class="stat-num" id="bc-total">—</div><div class="stat-label">on-chain events</div></div>
+    <div class="card"><h2>⏱ Last Block</h2><div class="stat-num" id="bc-block" style="font-size:1.5rem">—</div><div class="stat-label">transactions confirmed</div></div>
+  </div>
+  <div class="card">
+    <h2>🔐 Immutable Forensic Audit Trail — Blockchain Evidence</h2>
+    <div style="overflow-x:auto">
+      <table id="bc-table">
+        <thead><tr><th>#</th><th>Time</th><th>Device</th><th>Result</th><th>SHA-256 Hash</th><th>Tx Hash</th><th>Trust</th></tr></thead>
+        <tbody id="bc-body"><tr><td colspan="7" class="no-data">Loading...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ GALLERY ═══════════ -->
+<section id="gallery">
+  <div class="card" style="margin-bottom:1.25rem">
+    <h2>🚨 Intruder Alert Gallery — All Unauthorized Access Photos</h2>
+    <p style="font-size:.78rem;color:var(--m);margin-bottom:1rem">ESP32-CAM captures 5 burst photos on every DENY event. All photos below are linked to blockchain forensic records.</p>
+    <div class="photo-grid" id="gallery-grid"><div class="no-data">No intruder photos yet. Tap a fake card to trigger capture.</div></div>
+  </div>
+  <div class="card">
+    <h2>📺 Live Sentry Camera Feed</h2>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem">
+      <div><div class="cam-box" id="gal-cam"><div class="cam-empty">Awaiting capture...</div></div><div style="font-size:.7rem;color:var(--m);margin-top:.5rem;text-align:center">ESP32-CAM Perimeter</div></div>
+      <div style="display:flex;flex-direction:column;gap:.75rem;justify-content:center">
+        <div class="card" style="padding:.85rem"><h2>Total Intruder Photos</h2><div class="stat-num" id="gal-count" style="font-size:1.8rem">0</div></div>
+        <div class="card" style="padding:.85rem"><h2>Last Intruder Detected</h2><div style="font-size:.8rem" id="gal-last">Never</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════ SYSTEM HEALTH ═══════════ -->
+<section id="health">
+  <div class="grid g3" style="margin-bottom:1.25rem">
+    <div class="card"><h2>🌡 Temperature</h2><div class="stat-num" id="h-temp">—</div><div class="stat-label">°C — DHT22 Sensor</div></div>
+    <div class="card"><h2>💧 Humidity</h2><div class="stat-num" id="h-hum">—</div><div class="stat-label">% — DHT22 Sensor</div></div>
+    <div class="card"><h2>🕐 Clock Guard</h2><div class="stat-num" id="h-clock" style="font-size:1rem">Checking...</div><div class="stat-label">NTP drift status</div></div>
+  </div>
+  <div class="grid g2" style="margin-bottom:1.25rem">
+    <div class="card"><h2>🔧 Physical Sensors</h2><div id="h-sensors"><div class="no-data">Loading sensors...</div></div></div>
+    <div class="card">
+      <h2>⚠️ Attack Summary</h2>
+      <div class="grid g2" style="gap:.75rem" id="h-attacks">
+        <div class="sensor-row"><div><div class="sensor-lbl">WiFi Jamming</div></div><div class="stat-num" id="att-wifi" style="font-size:1.5rem;color:var(--r)">0</div></div>
+        <div class="sensor-row"><div><div class="sensor-lbl">Physical Tamper</div></div><div class="stat-num" id="att-tamper" style="font-size:1.5rem;color:var(--r)">0</div></div>
+        <div class="sensor-row"><div><div class="sensor-lbl">Thermal Sabotage</div></div><div class="stat-num" id="att-thermal" style="font-size:1.5rem;color:var(--y)">0</div></div>
+        <div class="sensor-row"><div><div class="sensor-lbl">AI Spoofing</div></div><div class="stat-num" id="att-spoof" style="font-size:1.5rem;color:var(--p)">0</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="card"><h2>📡 Device Heartbeat Monitor</h2><div id="h-devices"><div class="no-data">Waiting for devices...</div></div></div>
+</section>
+</main>
+<footer>ZERO-TRUST IoT PLATFORM v2.0 &nbsp;|&nbsp; Hardware-to-Patent &nbsp;|&nbsp; Raspberry Pi 5 &nbsp;|&nbsp; Ganache Blockchain &nbsp;|&nbsp; AI-LSTM Fingerprinting</footer>
+<script>
+const CONTRACT = "0x356F114Ac8cD18eA349268691a009A5614374bD4";
+document.getElementById('bc-contract').textContent = CONTRACT;
+
+// Clock
+setInterval(()=>{document.getElementById('clock').textContent=new Date().toLocaleTimeString()},1000);
+document.getElementById('clock').textContent=new Date().toLocaleTimeString();
+
+// Tab switching
+function showTab(id,btn){
+  document.querySelectorAll('main section').forEach(s=>s.classList.remove('section-active'));
+  document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id).classList.add('section-active');
+  btn.classList.add('active');
+}
+
+// Helpers
+const ts = t => new Date(t*1000).toLocaleString();
+const shortHash = h => h ? h.substring(0,14)+'...' : '—';
+const trustColor = s => s>=75?'var(--g)':s>=40?'var(--y)':'var(--r)';
+function copyText(t){navigator.clipboard.writeText(t).catch(()=>{})}
+
+// Trust bar HTML
+function trustBar(score){
+  const s=Math.min(100,Math.max(0,score||0));
+  return `<div class="trust-bar-wrap"><div class="trust-fill" style="width:${s}%;background:${trustColor(s)}"></div></div>`;
+}
+
+// Badge HTML
+function resultBadge(r){
+  if(!r) return '';
+  if(r==='AUTHENTICATED'||r==='GRANT') return `<span class="badge badge-g">✅ GRANTED</span>`;
+  if(r==='REJECTED'||r==='DENY') return `<span class="badge badge-r">❌ DENIED</span>`;
+  if(r==='HEARTBEAT_VERIFIED'||r==='HEARTBEAT') return `<span class="badge badge-c">💓 HEARTBEAT</span>`;
+  if(r==='ONLINE'||r==='AUTHENTICATED_DEVICE') return `<span class="badge badge-b">🟢 ONLINE</span>`;
+  if(r==='OFFLINE') return `<span class="badge" style="background:rgba(100,116,139,.15);color:var(--m)">⚫ OFFLINE</span>`;
+  if(r==='WARNING') return `<span class="badge badge-y">⚠️ WARNING</span>`;
+  return `<span class="badge badge-y">⚠️ ${r}</span>`;
+}
+
+// ── Overview ──────────────────────────────────────────────
+async function refreshOverview(){
+  try{
+    const [ev,dev,thr]=await Promise.all([
+      fetch('/api/events?limit=20').then(r=>r.json()),
+      fetch('/api/devices').then(r=>r.json()),
+      fetch('/api/threat_level').then(r=>r.json())
+    ]);
+    document.getElementById('ov-total').textContent=ev.total||0;
+    document.getElementById('ov-devices').textContent=dev.length||0;
+    document.getElementById('ov-denied').textContent=ev.rejected||0;
+    document.getElementById('ov-granted').textContent=ev.authenticated||0;
+
+    // Device trust scores
+    const dl=document.getElementById('ov-devices-list');
+    if(dev.length){
+      dl.innerHTML=dev.map(d=>`
+        <div style="padding:.85rem;background:rgba(255,255,255,.02);border-radius:8px;margin-bottom:.6rem">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.4rem">
+            <span class="mono">${d.device_id||d.id}</span>
+            ${resultBadge(d.status)}
+          </div>
+          ${trustBar(d.trust_score)}
+          <div style="display:flex;justify-content:space-between;font-size:.68rem;color:var(--m);margin-top:.3rem">
+            <span>Trust: ${(d.trust_score||0).toFixed(1)}%</span>
+            <span>RSSI: ${d.last_rssi||'—'} dBm</span>
+            <span>IPD: ${d.last_ipd||'—'} ms</span>
+          </div>
+        </div>`).join('');
+    }else dl.innerHTML='<div class="no-data">No devices connected</div>';
+
+    // Threat ring
+    const sc=thr.threat_score||0;
+    const c=sc>=70?'var(--r)':sc>=35?'var(--y)':'var(--g)';
+    const circ=339.3;
+    document.getElementById('threat-arc').style.strokeDashoffset=circ-(circ*sc/100);
+    document.getElementById('threat-arc').style.stroke=c;
+    document.getElementById('threat-num').textContent=sc;
+    document.getElementById('threat-num').style.color=c;
+    document.getElementById('threat-text').textContent=thr.color||'SECURE';
+    const al=document.getElementById('threat-alerts');
+    al.innerHTML=(thr.alerts||[]).map(a=>`<span class="badge badge-r">${a}</span>`).join('');
+
+    // Feed
+    const feed=document.getElementById('ov-feed');
+    if(ev.events&&ev.events.length){
+      feed.innerHTML=ev.events.map(e=>{
+        const cls=e.result==='AUTHENTICATED'?'grant':e.result==='REJECTED'?'deny':'warn';
+        return `<div class="ev ${cls}">
+          <div class="ev-time">${ts(e.timestamp)}</div>
+          <div class="ev-body">
+            <div class="ev-dev">${e.device_id||'Unknown'}</div>
+            <div class="ev-reason">${e.reason||e.result||''}</div>
+          </div>
+          ${resultBadge(e.result)}
+        </div>`;
+      }).join('');
+    }else feed.innerHTML='<div class="no-data">No events yet</div>';
+
+    // Camera
+    const cam=document.getElementById('ov-cam');
+    cam.innerHTML=`<img src="/api/photo/ESP32_CAM_PERIMETER?t=${Date.now()}" onerror="this.parentElement.innerHTML='<div class=cam-empty>No capture yet</div>'" alt="Sentry">`;
+  }catch(e){console.error('overview',e)}
+}
+
+// ── Access Log ──────────────────────────────────────────
+let allEvents=[];
+// RFID-only results — exclude heartbeat events from access log
+const RFID_RESULTS=['AUTHENTICATED','REJECTED','GRANT','DENY','WARNING','AI_SPOOFING'];
+async function refreshAccessLog(){
+  try{
+    const data=await fetch('/api/events?limit=500').then(r=>r.json());
+    // Filter to only show real RFID access events, not heartbeats
+    const raw=data.events||[];
+    allEvents=raw.filter(e=>e.result&&!e.result.includes('HEARTBEAT')||RFID_RESULTS.includes(e.result));
+    const rfidOnly=raw.filter(e=>!e.result||!e.result.includes('HEARTBEAT'));
+    document.getElementById('al-count').textContent=`Showing ${rfidOnly.length} RFID access events (${raw.length} total including heartbeats)`;
+    renderAccessTable();
+  }catch(e){console.error('access log',e)}
+}
+function renderAccessTable(){
+  const search=document.getElementById('al-search').value.toLowerCase();
+  const filter=document.getElementById('al-filter').value;
+  // Always exclude pure heartbeat events from Access Log
+  const rows=allEvents.filter(e=>{
+    const isHB=e.result&&e.result.includes('HEARTBEAT')&&!RFID_RESULTS.includes(e.result);
+    if(isHB) return false;
+    const matchF=!filter||e.result===filter||e.result===filter.replace('AUTHENTICATED','GRANT').replace('REJECTED','DENY');
+    const matchS=!search||(e.device_id||'').toLowerCase().includes(search)||(e.reason||'').toLowerCase().includes(search)||(e.result||'').toLowerCase().includes(search);
+    return matchF&&matchS;
+  });
+  const tbody=document.getElementById('al-body');
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="7" class="no-data">No matching events</td></tr>';return;}
+  tbody.innerHTML=rows.map((e,i)=>`<tr>
+    <td class="mono">${rows.length-i}</td>
+    <td style="font-size:.72rem;white-space:nowrap">${ts(e.timestamp)}</td>
+    <td class="mono">${e.device_id||'—'}</td>
+    <td>${resultBadge(e.result)}</td>
+    <td style="font-size:.72rem;color:var(--m);max-width:250px">${e.reason||'—'}</td>
+    <td>${trustBar(e.trust_score)}<span style="font-size:.65rem;color:var(--m)">${(e.trust_score||0).toFixed(1)}%</span></td>
+    <td><span class="mono" title="${e.event_hash||''}">${shortHash(e.event_hash)}</span>${e.event_hash?`<button class="copy-btn" onclick="copyText('${e.event_hash}')">copy</button>`:''}</td>
+  </tr>`).join('');
+}
+document.getElementById('al-search').addEventListener('input',renderAccessTable);
+document.getElementById('al-filter').addEventListener('change',renderAccessTable);
+
+// ── Blockchain ──────────────────────────────────────────
+async function refreshBlockchain(){
+  try{
+    const data=await fetch('/api/evidence?limit=100').then(r=>r.json());
+    document.getElementById('bc-total').textContent=data.length||0;
+    const tbody=document.getElementById('bc-body');
+    if(!data.length){tbody.innerHTML='<tr><td colspan="7" class="no-data">No blockchain records yet</td></tr>';return;}
+    tbody.innerHTML=data.map((e,i)=>`<tr>
+      <td class="mono">${data.length-i}</td>
+      <td style="font-size:.7rem;white-space:nowrap">${ts(e.timestamp)}</td>
+      <td class="mono" style="font-size:.72rem">${e.device_id||'—'}</td>
+      <td>${resultBadge(e.result)}</td>
+      <td><span class="mono" title="${e.event_hash||''}">${shortHash(e.event_hash)}</span>${e.event_hash?`<button class="copy-btn" onclick="copyText('${e.event_hash}')">⧉</button>`:''}</td>
+      <td>${e.on_chain_tx?`<span class="badge badge-g">✅ On-Chain</span><br><span class="mono" style="font-size:.65rem">${shortHash(e.on_chain_tx)}</span><button class="copy-btn" onclick="copyText('${e.on_chain_tx}')">⧉</button>`:'<span class="badge badge-y">⏳ Pending</span>'}</td>
+      <td>${trustBar(e.trust_score)}<span style="font-size:.65rem;color:var(--m)">${(e.trust_score||0).toFixed(1)}%</span></td>
+    </tr>`).join('');
+  }catch(e){console.error('blockchain',e)}
+}
+
+// ── Gallery ──────────────────────────────────────────
+async function refreshGallery(){
+  try{
+    const photos=await fetch('/api/deny_photos?limit=24').then(r=>r.json());
+    const grid=document.getElementById('gallery-grid');
+    document.getElementById('gal-count').textContent=photos.length;
+    if(photos.length){
+      document.getElementById('gal-last').textContent=photos[0]?ts(new Date(photos[0].timestamp).getTime()/1000):'Never';
+      grid.innerHTML=photos.map(p=>`
+        <div class="photo-card" onclick="window.open('/api/deny_photo_img?path=${encodeURIComponent(p.photo_path)}','_blank')">
+          <img src="/api/deny_photo_img?path=${encodeURIComponent(p.photo_path)}" alt="Intruder" loading="lazy" onerror="this.style.display='none'">
+          <div class="photo-meta">
+            <div style="color:var(--r);font-weight:700">❌ DENIED</div>
+            <div>${p.uid||'Unknown UID'}</div>
+            <div>${p.timestamp||''}</div>
+          </div>
+        </div>`).join('');
+    }else grid.innerHTML='<div class="no-data">No intruder photos yet. Tap a fake card to trigger capture.</div>';
+    // Live cam
+    document.getElementById('gal-cam').innerHTML=`<img src="/api/photo/ESP32_CAM_PERIMETER?t=${Date.now()}" onerror="this.parentElement.innerHTML='<div class=cam-empty>Awaiting...</div>'" alt="Cam">`;
+  }catch(e){console.error('gallery',e)}
+}
+
+// ── System Health ──────────────────────────────────────────
+async function refreshHealth(){
+  try{
+    const [env,sensors,dev,ev]=await Promise.all([
+      fetch('/api/environment').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/sensors').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/devices').then(r=>r.json()).catch(()=>[]),
+      fetch('/api/events?limit=500').then(r=>r.json()).catch(()=>({events:[]}))
+    ]);
+    document.getElementById('h-temp').textContent=env.temperature!=null?env.temperature.toFixed(1)+'°C':'—';
+    document.getElementById('h-hum').textContent=env.humidity!=null?env.humidity.toFixed(1)+'%':'—';
+
+    const clock=await fetch('/api/clock').then(r=>r.json()).catch(()=>({tampered:false}));
+    const ce=document.getElementById('h-clock');
+    ce.textContent=clock.tampered?'⚠️ TAMPERED':'✅ Synced';
+    ce.style.color=clock.tampered?'var(--r)':'var(--g)';
+
+    // Sensors
+    const sh=document.getElementById('h-sensors');
+    if(sensors&&Object.keys(sensors).length){
+      sh.innerHTML=Object.entries(sensors).map(([k,v])=>`
+        <div class="sensor-row ${v.alert?'alert':''}">
+          <div><div class="sensor-lbl">${k}</div><div style="font-size:.75rem">${v.description||''}</div></div>
+          <div class="sensor-val" style="color:${v.alert?'var(--r)':'var(--g)'}">${v.value!=null?v.value:'—'}</div>
+        </div>`).join('');
+    }else sh.innerHTML='<div class="sensor-row"><div><div class="sensor-lbl">SW-420 Tamper</div></div><div class="sensor-val" style="color:var(--g)">OK</div></div><div class="sensor-row"><div><div class="sensor-lbl">DHT22 Sensor</div></div><div class="sensor-val" style="color:var(--g)">OK</div></div>';
+
+    // Attack counters from events
+    const events=ev.events||[];
+    document.getElementById('att-wifi').textContent=events.filter(e=>e.reason&&(e.reason.toLowerCase().includes('jamm')||e.reason.toLowerCase().includes('wifi'))).length;
+    document.getElementById('att-tamper').textContent=events.filter(e=>e.reason&&e.reason.toLowerCase().includes('tamper')).length;
+    document.getElementById('att-thermal').textContent=events.filter(e=>e.reason&&e.reason.toLowerCase().includes('thermal')).length;
+    document.getElementById('att-spoof').textContent=events.filter(e=>(e.result==='REJECTED'||e.result==='AI_SPOOFING')&&e.reason&&(e.reason.toLowerCase().includes('spoof')||e.reason.toLowerCase().includes('ai_spoof'))).length;
+
+    // Device heartbeats
+    const dh=document.getElementById('h-devices');
+    if(dev.length){
+      dh.innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>Device</th><th>Status</th><th>Trust Score</th><th>RSSI</th><th>IPD</th><th>Last Seen</th></tr></thead><tbody>${
+        dev.map(d=>`<tr>
+          <td class="mono">${d.device_id||d.id}</td>
+          <td>${resultBadge(d.status)}</td>
+          <td style="min-width:120px">${trustBar(d.trust_score)}<span style="font-size:.65rem;color:var(--m)">${(d.trust_score||0).toFixed(1)}%</span></td>
+          <td class="mono">${d.last_rssi||'—'}</td>
+          <td class="mono">${d.last_ipd||'—'} ms</td>
+          <td style="font-size:.72rem">${d.last_seen?ts(d.last_seen):'—'}</td>
+        </tr>`).join('')
+      }</tbody></table></div>`;
+    }else dh.innerHTML='<div class="no-data">No devices detected</div>';
+  }catch(e){console.error('health',e)}
+}
+
+// ── Master Refresh ──────────────────────────────────────────
+async function refreshAll(){
+  const active=document.querySelector('main section.section-active').id;
+  refreshOverview();
+  if(active==='accesslog') refreshAccessLog();
+  if(active==='blockchain') refreshBlockchain();
+  if(active==='gallery') refreshGallery();
+  if(active==='health') refreshHealth();
+}
+
+// Also refresh non-active tabs when switching
+const origShow=window.showTab;
+window.showTab=(id,btn)=>{
+  origShow?origShow(id,btn):null;
+  document.querySelectorAll('main section').forEach(s=>s.classList.remove('section-active'));
+  document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id).classList.add('section-active');
+  btn.classList.add('active');
+  if(id==='accesslog') refreshAccessLog();
+  if(id==='blockchain') refreshBlockchain();
+  if(id==='gallery') refreshGallery();
+  if(id==='health') refreshHealth();
+};
+
+refreshAll();
+setInterval(refreshAll, 3000);
+</script>
+</body>
+</html>
